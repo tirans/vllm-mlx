@@ -148,14 +148,15 @@ class TestSimpleEngineConcurrency:
             )
 
     @pytest.mark.anyio
-    async def test_default_admission_rejects_second_serialized_request(self):
-        """Default SimpleEngine admission fails fast instead of queueing."""
+    async def test_fail_fast_admission_rejects_second_serialized_request(self):
+        """admission=fail_fast rejects instead of queueing (legacy policy)."""
         from vllm_mlx.engine.base import EngineBusy
         from vllm_mlx.engine.simple import SimpleEngine
 
         with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
             engine._loaded = True
+            engine._generation_lock_admission = "fail_fast"
 
             started = threading.Event()
             release = threading.Event()
@@ -228,6 +229,268 @@ class TestSimpleEngineConcurrency:
 
             await first
             assert engine._generation_lock_holder_summary() == "none"
+
+    def _idle_engine(self):
+        """A loaded SimpleEngine with no model, for admission-only tests."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+        engine._loaded = True
+        return engine
+
+    def test_default_admission_is_bounded_queue(self):
+        """Out of the box a second request queues rather than being rejected."""
+        engine = self._idle_engine()
+
+        assert engine._generation_lock_admission == "queue"
+        lock_stats = engine.get_stats()["generation_lock"]
+        assert lock_stats["admission"] == "queue"
+        assert lock_stats["max_queue"] == 32
+        assert lock_stats["queue_timeout_s"] == 120.0
+
+    def test_invalid_admission_falls_back_to_queue(self, monkeypatch):
+        """An unrecognised policy warns and uses the default."""
+        monkeypatch.setenv("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "nonsense")
+
+        assert self._idle_engine()._generation_lock_admission == "queue"
+
+    def test_lock_admission_env_fail_fast_is_preserved(self, monkeypatch):
+        """The legacy reject-on-contention policy is still selectable."""
+        monkeypatch.setenv("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "fail_fast")
+
+        engine = self._idle_engine()
+        assert engine._generation_lock_admission == "fail_fast"
+        assert engine.get_stats()["generation_lock"]["admission"] == "fail_fast"
+
+    def test_queue_caps_are_configurable(self, monkeypatch):
+        """Queue depth and deadline come from the environment."""
+        monkeypatch.setenv("VLLM_MLX_SIMPLE_ENGINE_MAX_QUEUE", "0")
+        monkeypatch.setenv("VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S", "5.5")
+        monkeypatch.setenv("VLLM_MLX_SIMPLE_ENGINE_RETRY_AFTER_S", "7")
+
+        engine = self._idle_engine()
+        assert engine._generation_max_queue == 1  # clamped up from 0
+        assert engine._generation_queue_timeout_s == 5.5
+        assert engine._generation_retry_after_s == 7.0
+
+    @pytest.mark.anyio
+    async def test_default_admission_queues_second_serialized_request(self):
+        """The reported bug: an overlapping request waits instead of failing."""
+        engine = self._idle_engine()
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_call():
+            started.set()
+            release.wait(timeout=2.0)
+            return "first"
+
+        first = asyncio.create_task(
+            engine._run_blocking_serialized(slow_call, request_id="holder")
+        )
+        await asyncio.to_thread(started.wait, 1.0)
+
+        second = asyncio.create_task(
+            engine._run_blocking_serialized(lambda: "second", request_id="waiter")
+        )
+        for _ in range(200):
+            if engine._generation_waiters:
+                break
+            await asyncio.sleep(0.001)
+
+        assert not second.done(), "second request should be queued, not rejected"
+        assert engine._generation_waiters == 1
+        assert engine.get_stats()["num_waiting"] == 1
+
+        release.set()
+        assert await first == "first"
+        assert await second == "second"
+        assert engine._generation_busy_rejections == 0
+        assert engine._generation_waiters == 0
+        assert not engine._generation_lock.locked()
+
+    @pytest.mark.anyio
+    async def test_queue_full_rejects_with_engine_busy(self):
+        """Past the queue cap, admission rejects with a retryable error."""
+        from vllm_mlx.engine.base import EngineBusy
+
+        engine = self._idle_engine()
+        engine._generation_max_queue = 1
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_call():
+            started.set()
+            release.wait(timeout=2.0)
+            return "ok"
+
+        first = asyncio.create_task(
+            engine._run_blocking_serialized(slow_call, request_id="holder")
+        )
+        await asyncio.to_thread(started.wait, 1.0)
+
+        queued = asyncio.create_task(
+            engine._run_blocking_serialized(lambda: "queued", request_id="waiter")
+        )
+        for _ in range(200):
+            if engine._generation_waiters:
+                break
+            await asyncio.sleep(0.001)
+
+        with pytest.raises(EngineBusy) as excinfo:
+            await engine._run_blocking_serialized(
+                lambda: "rejected", request_id="overflow"
+            )
+
+        assert excinfo.value.reason == "queue_full"
+        assert excinfo.value.code == "text_generation_busy"
+        assert excinfo.value.retry_after >= 1
+        assert "active=holder" in str(excinfo.value)
+        assert engine._generation_queue_full_rejections == 1
+        assert engine._generation_busy_rejections == 1
+
+        release.set()
+        await first
+        await queued
+
+    @pytest.mark.anyio
+    async def test_queue_timeout_rejects_and_leaves_lock_free(self):
+        """A queue deadline rejects the waiter without stranding the lock."""
+        from vllm_mlx.engine.base import EngineBusy
+
+        engine = self._idle_engine()
+        engine._generation_queue_timeout_s = 0.05
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_call():
+            started.set()
+            release.wait(timeout=2.0)
+            return "ok"
+
+        first = asyncio.create_task(
+            engine._run_blocking_serialized(slow_call, request_id="holder")
+        )
+        await asyncio.to_thread(started.wait, 1.0)
+
+        with pytest.raises(EngineBusy) as excinfo:
+            await engine._run_blocking_serialized(
+                lambda: "late", request_id="impatient"
+            )
+
+        assert excinfo.value.reason == "queue_timeout"
+        assert engine._generation_queue_timeout_rejections == 1
+
+        release.set()
+        await first
+        assert not engine._generation_lock.locked()
+        assert engine._generation_waiters == 0
+
+    @pytest.mark.anyio
+    async def test_queue_timeout_race_does_not_leak_lock(self):
+        """A timeout that fires after acquire() won must hand the lock on.
+
+        asyncio.wait_for reports a timeout even when the awaited acquire
+        already returned True; without the discard step the lock would stay
+        held by nobody and wedge the engine permanently.
+        """
+        engine = self._idle_engine()
+
+        await engine._generation_lock.acquire()
+        acquire_task = asyncio.ensure_future(engine._generation_lock.acquire())
+        for _ in range(5):
+            await asyncio.sleep(0)  # let it park on the lock
+        engine._generation_lock.release()  # resolve it before we discard
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert await engine._discard_acquire_task(acquire_task) is True
+        assert not engine._generation_lock.locked()
+
+        # And the lock is genuinely usable again.
+        await asyncio.wait_for(engine._generation_lock.acquire(), 0.5)
+        engine._generation_lock.release()
+
+    @pytest.mark.anyio
+    async def test_continuation_bypasses_queue_cap(self):
+        """A request already admitted is never evicted by the queue cap."""
+        from vllm_mlx.engine.simple import _generation_admitted
+
+        engine = self._idle_engine()
+        engine._generation_max_queue = 1
+        engine._generation_waiters = 99  # queue looks saturated
+
+        _generation_admitted.set(True)
+        async with engine._acquire_generation_slot("continuation"):
+            assert engine._generation_lock.locked()
+
+        assert engine._generation_busy_rejections == 0
+
+    @pytest.mark.anyio
+    async def test_holder_summary_reports_only_the_real_holder(self):
+        """Tracker bookkeeping rows must not masquerade as lock holders."""
+        import uuid
+
+        engine = self._idle_engine()
+        stray = str(uuid.uuid4())
+        engine._active_requests[stray] = {
+            "request_id": stray,
+            "status": "running",
+            "phase": "prefill",
+            "elapsed_s": 0.0,
+        }
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_call():
+            started.set()
+            release.wait(timeout=2.0)
+            return "ok"
+
+        first = asyncio.create_task(
+            engine._run_blocking_serialized(slow_call, request_id="real-holder")
+        )
+        await asyncio.to_thread(started.wait, 1.0)
+
+        summary = engine._generation_lock_holder_summary()
+        assert "real-holder" in summary
+        assert "blocking_serialized" in summary
+        assert stray not in summary
+
+        release.set()
+        await first
+        assert engine._generation_lock_holder_summary() == "none"
+
+    @pytest.mark.anyio
+    async def test_wait_mode_has_no_cap_or_timeout(self):
+        """Legacy wait mode still never rejects (issue #615)."""
+        engine = self._idle_engine()
+        engine._generation_lock_admission = "wait"
+        engine._generation_max_queue = 1
+        engine._generation_queue_timeout_s = 0.01
+
+        release = threading.Event()
+
+        def slow_call():
+            release.wait(timeout=2.0)
+            return "ok"
+
+        tasks = [
+            asyncio.create_task(
+                engine._run_blocking_serialized(slow_call, request_id=f"w{i}")
+            )
+            for i in range(3)
+        ]
+        await asyncio.sleep(0.05)
+        release.set()
+
+        assert await asyncio.gather(*tasks) == ["ok", "ok", "ok"]
+        assert engine._generation_busy_rejections == 0
 
     async def test_chat_with_tools_aggregates_streaming_path(self, mock_llm_model):
         """Tool-enabled non-stream chat should use the streaming path."""

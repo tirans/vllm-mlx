@@ -532,7 +532,7 @@ Response fields:
 | `uptime_s` | Seconds since the server started |
 | `steps_executed` | Total inference steps executed |
 | `num_running` | Number of requests currently generating tokens |
-| `num_waiting` | Number of requests queued for prefill |
+| `num_waiting` | Requests waiting for the serialized generation route (SimpleEngine) or queued for prefill (batched engine) |
 | `total_requests_processed` | Total requests completed since startup |
 | `total_prompt_tokens` | Total prompt tokens processed since startup |
 | `total_completion_tokens` | Total completion tokens generated since startup |
@@ -541,13 +541,28 @@ Response fields:
 | `metal.cache_memory_gb` | Metal cache memory usage (GB) |
 | `cache` | Cache statistics (type, entries, hit rate, memory usage) |
 | `requests` | List of active requests with per-request details |
+| `generation_lock` | SimpleEngine serialized-route state (see below) |
+
+Fields in `generation_lock` (SimpleEngine only):
+
+| Field | Description |
+|-------|-------------|
+| `locked` | Whether a generation currently owns the route |
+| `admission` | Active policy: `queue`, `wait`, or `fail_fast` |
+| `max_queue` | Queue depth allowed before requests are refused |
+| `queue_timeout_s` | Seconds a request may wait before being refused |
+| `waiting` | Requests currently waiting for the route |
+| `holder` | Request id of the current holder, or `null` |
+| `busy_rejections` | Total refusals since startup |
+| `queue_full_rejections` | Refusals caused by a full queue |
+| `queue_timeout_rejections` | Refusals caused by an expired wait |
 
 Per-request fields in `requests`:
 
 | Field | Description |
 |-------|-------------|
 | `request_id` | Unique request identifier |
-| `phase` | Current phase: `queued`, `prefill`, or `generation` |
+| `phase` | Current phase: `prefill` or `generation` |
 | `tokens_per_second` | Generation throughput for this request |
 | `ttft_s` | Time to first token (seconds) |
 | `progress` | Completion percentage (0.0 to 1.0) |
@@ -555,6 +570,24 @@ Per-request fields in `requests`:
 | `cached_tokens` | Number of tokens served from cache |
 | `generated_tokens` | Tokens generated so far |
 | `max_tokens` | Maximum tokens requested |
+
+## Overload Behavior
+
+SimpleEngine serializes generation, so overlapping requests queue by default
+(see [Serialized Engine Admission](../reference/configuration.md#serialized-engine-admission)).
+When the queue is full or a wait expires, the request is refused:
+
+- **Non-streaming** requests get HTTP **503** with a `Retry-After` header.
+  `/v1/messages` uses the Anthropic envelope
+  (`{"type": "error", "error": {"type": "overloaded_error", ...}}`); the
+  OpenAI-compatible endpoints use `{"error": {..., "code": "text_generation_busy"}}`.
+- **Streaming** requests get HTTP **200** followed by an in-band error event —
+  `event: error` on `/v1/messages` and `/v1/responses`, a `data:` frame
+  carrying `error` on the OpenAI endpoints. A streaming response commits its
+  status line before generation starts, so a real 503 is impossible once the
+  stream has opened.
+
+Refusals never surface as HTTP 500, and a stream is never silently truncated.
 
 ## Tool Calling
 

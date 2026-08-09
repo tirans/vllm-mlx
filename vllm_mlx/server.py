@@ -51,12 +51,12 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.routing import Match
@@ -1026,15 +1026,67 @@ def _log_and_raise_internal_error(log_prefix: str, exc: Exception, detail: str) 
     raise HTTPException(status_code=500, detail=detail)
 
 
-def _raise_engine_busy(exc: EngineBusy) -> None:
-    """Translate serialized-engine admission failures into retryable HTTP 503."""
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "error": exc.code,
+def _engine_busy_payload(path: str, exc: EngineBusy) -> dict:
+    """Build the busy error body in the dialect the caller's endpoint speaks."""
+    if path.startswith("/v1/messages"):
+        return {
+            "type": "error",
+            "error": {
+                "type": "overloaded_error",
+                "message": str(exc),
+            },
+        }
+    return {
+        "error": {
             "message": str(exc),
-        },
-    ) from exc
+            "type": "server_error",
+            "param": None,
+            "code": exc.code,
+        }
+    }
+
+
+def _engine_busy_headers(exc: EngineBusy) -> dict[str, str]:
+    """Tell the client how long to back off before retrying."""
+    return {"Retry-After": str(exc.retry_after)}
+
+
+def _anthropic_error_frame(exc: EngineBusy) -> str:
+    """In-band SSE error for /v1/messages.
+
+    A streaming response commits its status line before the engine is ever
+    called, so an admission failure cannot become a real 503 here -- an SSE
+    frame is the only channel left.
+    """
+    payload = {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": str(exc)},
+    }
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
+
+
+def _openai_error_frame(exc: EngineBusy) -> str:
+    """In-band SSE error for the OpenAI-compatible streaming endpoints."""
+    payload = {
+        "error": {
+            "message": str(exc),
+            "type": "server_error",
+            "param": None,
+            "code": exc.code,
+        }
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _responses_error_frame(exc: EngineBusy) -> str:
+    """In-band SSE error for the Responses API stream."""
+    payload = {
+        "type": "error",
+        "code": exc.code,
+        "message": str(exc),
+        "param": None,
+    }
+    return f"event: error\ndata: {json.dumps(payload)}\n\n"
 
 
 @dataclass
@@ -1542,6 +1594,23 @@ app = FastAPI(
 )
 
 security = HTTPBearer(auto_error=False)
+
+
+@app.exception_handler(EngineBusy)
+async def _engine_busy_exception_handler(request: Request, exc: EngineBusy):
+    """Backstop so no admission failure can ever escape as a raw 500.
+
+    Note this cannot fire once a StreamingResponse body has started, which is
+    why the SSE generators emit their own in-band error frames.
+    """
+    logger.warning(
+        "Engine busy on %s (reason=%s): %s", request.url.path, exc.reason, exc
+    )
+    return JSONResponse(
+        status_code=503,
+        content=_engine_busy_payload(request.url.path, exc),
+        headers=_engine_busy_headers(exc),
+    )
 
 
 def _metrics_result_from_status(status_code: int) -> str:
@@ -2423,6 +2492,22 @@ async def _run_responses_request(
 
 
 async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
+    """Stream a Responses API request, reporting overload in-band.
+
+    The status line is committed before the engine is called, so an admission
+    failure can only be surfaced as an SSE error event.
+    """
+    try:
+        async for chunk in _stream_responses_request_impl(request):
+            yield chunk
+    except EngineBusy as exc:
+        logger.warning("Responses stream rejected (busy): %s", exc)
+        yield _responses_error_frame(exc)
+
+
+async def _stream_responses_request_impl(
+    request: ResponsesRequest,
+) -> AsyncIterator[str]:
     """Execute a Responses API request and stream SSE events incrementally."""
     engine, chat_request, messages, chat_kwargs = _prepare_streaming_responses_request(
         request
@@ -4221,6 +4306,7 @@ async def list_voices(model: str = "kokoro"):
 async def _ensure_sse_terminal(
     generator: AsyncIterator[str],
     terminal_frame: str,
+    error_frame: "Callable[[BaseException], str | None] | None" = None,
 ) -> AsyncIterator[str]:
     """Guarantee that *terminal_frame* is emitted exactly once at the end of
     *generator*, even if the generator raises mid-stream.
@@ -4228,18 +4314,42 @@ async def _ensure_sse_terminal(
     If the inner generator already yields the terminal frame on its happy path,
     the wrapper detects it and avoids double-emission.  If the generator raises
     before reaching the terminal, the wrapper emits it in the ``finally`` block.
+
+    When *error_frame* produces a frame for the failure, it is emitted before
+    the terminal so the client sees a cause rather than a silently truncated
+    response.
+
+    ``GeneratorExit`` (client disconnect, i.e. ``aclose()``) must not yield:
+    an async generator that yields while closing raises ``RuntimeError``.
     """
     emitted = False
+    closing = False
     try:
         async for chunk in generator:
             if chunk == terminal_frame:
                 emitted = True
             yield chunk
+    except (GeneratorExit, asyncio.CancelledError):
+        closing = True
+        raise
     except Exception as e:
         logger.error(f"Streaming error, ensuring terminal frame: {e}")
+        if error_frame is not None:
+            frame = error_frame(e)
+            if frame:
+                yield frame
     finally:
-        if not emitted:
+        if not emitted and not closing:
             yield terminal_frame
+
+
+def _busy_error_frame(builder) -> "Callable[[BaseException], str | None]":
+    """Adapt a busy-frame builder into an _ensure_sse_terminal error factory."""
+
+    def _frame(exc: BaseException) -> str | None:
+        return builder(exc) if isinstance(exc, EngineBusy) else None
+
+    return _frame
 
 
 def _find_uvicorn_cycle(obj, depth=0, visited=None):
@@ -4756,6 +4866,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                             metrics_tracker=tracker,
                         ),
                         "data: [DONE]\n\n",
+                        _busy_error_frame(_openai_error_frame),
                     ),
                     raw_request,
                     cleanup=_make_release_cleanup(raw_request),
@@ -4809,7 +4920,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 raise
             except EngineBusy as exc:
                 tracker.finish(result="busy")
-                _raise_engine_busy(exc)
+                raise
             if output is None:
                 tracker.finish(
                     result="client_closed",
@@ -4966,6 +5077,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                             **prepared.chat_kwargs,
                         ),
                         "data: [DONE]\n\n",
+                        _busy_error_frame(_openai_error_frame),
                     ),
                     raw_request,
                     cleanup=_make_release_cleanup(raw_request),
@@ -4990,7 +5102,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             raise
         except EngineBusy as exc:
             tracker.finish(result="busy")
-            _raise_engine_busy(exc)
+            raise
         if output is None:
             tracker.finish(result="client_closed")
             return Response(status_code=499)  # Client closed request
@@ -5387,6 +5499,7 @@ async def create_anthropic_message(
                             metrics_tracker=tracker,
                         ),
                         anthropic_terminal,
+                        _busy_error_frame(_anthropic_error_frame),
                     ),
                     request,
                     cleanup=_make_release_cleanup(request),
@@ -5411,6 +5524,9 @@ async def create_anthropic_message(
             )
         except HTTPException as exc:
             tracker.finish(result=_metrics_result_from_status(exc.status_code))
+            raise
+        except EngineBusy as exc:
+            tracker.finish(result="busy")
             raise
         if output is None:
             tracker.finish(result="client_closed")
@@ -5925,6 +6041,13 @@ async def _stream_anthropic_messages(
 
         # Emit message_stop
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    except EngineBusy as exc:
+        # The status line is already committed, so report the overload in-band
+        # rather than truncating the stream into an empty message.
+        result_label = "busy"
+        logger.warning("Anthropic stream rejected (busy): %s", exc)
+        yield _anthropic_error_frame(exc)
+        return
     except HTTPException as exc:
         result_label = _metrics_result_from_status(exc.status_code)
         raise
@@ -6013,6 +6136,11 @@ async def stream_completion(
             if output.finished:
                 data["usage"] = get_usage(output).model_dump()
             yield f"data: {json.dumps(data)}\n\n"
+    except EngineBusy as exc:
+        result = "busy"
+        logger.warning("Completion stream rejected (busy): %s", exc)
+        yield _openai_error_frame(exc)
+        return
     except HTTPException as exc:
         result = _metrics_result_from_status(exc.status_code)
         raise
@@ -6459,6 +6587,12 @@ async def stream_chat_completion(
             yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
         yield "data: [DONE]\n\n"
+    except EngineBusy as exc:
+        result_label = "busy"
+        logger.warning("Chat completion stream rejected (busy): %s", exc)
+        yield _openai_error_frame(exc)
+        yield "data: [DONE]\n\n"
+        return
     except HTTPException as exc:
         result_label = _metrics_result_from_status(exc.status_code)
         raise

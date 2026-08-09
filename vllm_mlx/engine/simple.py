@@ -28,6 +28,16 @@ _in_tracker: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_simple_engine_in_tracker", default=False
 )
 
+# Set once a logical request has been admitted to the serialized route. A
+# single request takes the slot several times in sequence (the system-KV
+# snapshot, then the generation run); those continuations still queue for the
+# lock but must be exempt from the queue cap, or a long request could be
+# evicted mid-flight by newer arrivals. Like _in_tracker this is only ever
+# .set() -- never .reset(), which raises across generator/task boundaries.
+_generation_admitted: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_simple_engine_generation_admitted", default=False
+)
+
 import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
@@ -38,6 +48,7 @@ from .base import (
     GenerationOutput,
     cleanup_startup_cancellation,
     run_blocking_startup_work,
+    suspend_cancellation,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
 from ..mlx_streams import bind_generation_streams
@@ -48,6 +59,38 @@ logger = logging.getLogger(__name__)
 def _bind_worker_generation_streams() -> None:
     """Rebind mlx generation streams inside the current worker thread."""
     bind_generation_streams()
+
+
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    """Read an int env var, warning and falling back on anything unusable."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning("%s=%d is below %d; clamping", name, value, minimum)
+        return minimum
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float | None = None) -> float:
+    """Read a float env var, warning and falling back on anything unusable."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning("%s=%s is below %s; clamping", name, value, minimum)
+        return minimum
+    return value
 
 
 def _seed_logits_processors(
@@ -215,19 +258,39 @@ class SimpleEngine(BaseEngine):
 
         # Lock to serialize MLX operations (prevents Metal command buffer conflicts)
         self._generation_lock = asyncio.Lock()
+        # Admission policy for that lock:
+        #   queue     (default) bounded FIFO wait; rejects only when the queue
+        #             is full or the wait exceeds the acquisition timeout.
+        #   wait      legacy unbounded wait that never rejects (issue #615).
+        #   fail_fast legacy reject-on-contention (issue #540).
         self._generation_lock_admission = (
-            os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "fail_fast")
+            os.environ.get("VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION", "queue")
             .strip()
             .lower()
         )
-        if self._generation_lock_admission not in {"fail_fast", "wait"}:
+        if self._generation_lock_admission not in {"queue", "wait", "fail_fast"}:
             logger.warning(
-                "Invalid VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=%r; using fail_fast",
+                "Invalid VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION=%r; using queue",
                 self._generation_lock_admission,
             )
-            self._generation_lock_admission = "fail_fast"
+            self._generation_lock_admission = "queue"
+        self._generation_max_queue = _env_int(
+            "VLLM_MLX_SIMPLE_ENGINE_MAX_QUEUE", 32, minimum=1
+        )
+        # Kept below the server's default request timeout (300s) so a saturated
+        # queue yields a clean retryable 503 instead of a 504 or a truncated
+        # stream. 0 disables the deadline.
+        self._generation_queue_timeout_s = _env_float(
+            "VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S", 120.0
+        )
+        self._generation_retry_after_s = _env_float(
+            "VLLM_MLX_SIMPLE_ENGINE_RETRY_AFTER_S", 2.0, minimum=0.0
+        )
         self._generation_waiters = 0
         self._generation_busy_rejections = 0
+        self._generation_queue_full_rejections = 0
+        self._generation_queue_timeout_rejections = 0
+        self._generation_lock_holder_id: str | None = None
 
         # System prompt KV cache (reduces repeated prefill across requests).
         # OrderedDict acts as an LRU keyed by system-prefix hash so that the
@@ -350,52 +413,146 @@ class SimpleEngine(BaseEngine):
         return self._model.tokenizer
 
     def _generation_lock_holder_summary(self) -> str:
-        if not self._active_requests:
+        """Describe the one real lock holder, if any.
+
+        ``_active_requests`` also carries bookkeeping rows from
+        ``_track_request_stream`` that hold no lock, so iterating it reported
+        unrelated requests -- and the complainant itself -- as "active".
+        """
+        holder_id = self._generation_lock_holder_id
+        if holder_id is None:
             return "none"
 
-        holders = []
-        now = time.time()
-        for request_id, info in self._active_requests.items():
-            elapsed_s = info.get("elapsed_s")
-            started_at = info.get("started_at")
-            if started_at is not None:
-                elapsed_s = round(now - started_at, 1)
-            kind = info.get("kind", "unknown")
-            status = info.get("status", "unknown")
-            holders.append(
-                f"{request_id}:{status}:{kind}:"
-                f"prompt={info.get('prompt_tokens', 0)}:"
-                f"completion={info.get('completion_tokens', 0)}:"
-                f"elapsed_s={elapsed_s if elapsed_s is not None else 'unknown'}"
+        info = self._active_requests.get(holder_id)
+        if not info:
+            # Holder owns the slot but has not registered its detail row yet.
+            return f"{holder_id}:holding"
+
+        elapsed_s = info.get("elapsed_s")
+        started_at = info.get("started_at")
+        if started_at is not None:
+            elapsed_s = round(time.time() - started_at, 1)
+        return (
+            f"{holder_id}:{info.get('status', 'unknown')}:"
+            f"{info.get('kind', 'unknown')}:"
+            f"prompt={info.get('prompt_tokens', 0)}:"
+            f"completion={info.get('completion_tokens', 0)}:"
+            f"elapsed_s={elapsed_s if elapsed_s is not None else 'unknown'}"
+        )
+
+    def _reject_busy(
+        self,
+        request_id: str,
+        reason: str,
+        *,
+        waited_s: float | None = None,
+    ) -> None:
+        """Count the rejection and raise a retryable EngineBusy."""
+        self._generation_busy_rejections += 1
+        if reason == "queue_full":
+            self._generation_queue_full_rejections += 1
+            detail = (
+                f"generation queue is full (waiting={self._generation_waiters}, "
+                f"max={self._generation_max_queue})"
             )
-        return ",".join(holders)
+        elif reason == "queue_timeout":
+            self._generation_queue_timeout_rejections += 1
+            detail = (
+                f"timed out after {waited_s:.1f}s waiting for the serialized "
+                "MLX route"
+            )
+        else:
+            detail = "serialized route is busy (admission=fail_fast)"
+        raise EngineBusy(
+            f"SimpleEngine {detail}; "
+            f"request_id={request_id}; "
+            f"active={self._generation_lock_holder_summary()}; "
+            f"waiters={self._generation_waiters}; "
+            f"retry after {self._generation_retry_after_s:.0f}s",
+            reason=reason,
+            retry_after=self._generation_retry_after_s,
+        )
+
+    async def _discard_acquire_task(self, acquire_task) -> bool:
+        """Abandon a pending lock acquisition without leaking the lock.
+
+        ``asyncio.wait_for`` can report a timeout *after* ``Lock.acquire()``
+        already returned True: the CancelledError is delivered at the next
+        suspension point, which is inside the timeout's ``__aexit__``. Simply
+        unwinding would leave the lock held by nobody and wedge the engine
+        permanently, so check whether we won the race and, if so, hand the
+        lock straight to the next waiter.
+        """
+        acquire_task.cancel()
+        try:
+            acquired = await acquire_task
+        except asyncio.CancelledError:
+            return False
+        if acquired:
+            self._generation_lock.release()
+        return bool(acquired)
+
+    async def _acquire_generation_lock(self, request_id: str, timeout: float) -> None:
+        """Take the generation lock, bounded by *timeout* when positive."""
+        if timeout <= 0:
+            await self._generation_lock.acquire()
+            return
+
+        started = time.monotonic()
+        acquire_task = asyncio.ensure_future(self._generation_lock.acquire())
+        try:
+            await asyncio.wait_for(asyncio.shield(acquire_task), timeout)
+        except asyncio.TimeoutError:
+            await self._discard_acquire_task(acquire_task)
+            self._reject_busy(
+                request_id, "queue_timeout", waited_s=time.monotonic() - started
+            )
+        except BaseException:
+            # Outer cancellation (client disconnect). Finish the discard
+            # deterministically before propagating.
+            with suspend_cancellation():
+                await self._discard_acquire_task(acquire_task)
+            raise
 
     @asynccontextmanager
     async def _acquire_generation_slot(self, request_id: str):
-        """Admission control for SimpleEngine's serialized MLX route."""
-        if (
-            self._generation_lock_admission == "fail_fast"
-            and self._generation_lock.locked()
-        ):
-            self._generation_busy_rejections += 1
-            raise EngineBusy(
-                "SimpleEngine serialized route is busy; "
-                f"request_id={request_id}; "
-                f"active={self._generation_lock_holder_summary()}; "
-                f"waiters={self._generation_waiters}; "
-                "retry later"
-            )
+        """Admission control for SimpleEngine's serialized MLX route.
+
+        MLX/Metal work is strictly serialized; the policy here only decides
+        what happens to the requests waiting their turn. See the admission
+        modes documented where ``_generation_lock_admission`` is read.
+        """
+        mode = self._generation_lock_admission
+
+        if mode == "fail_fast" and self._generation_lock.locked():
+            self._reject_busy(request_id, "fail_fast")
+
+        # Continuations of an already-admitted request skip the cap and the
+        # deadline: the outer HTTP timeout already bounds them, and timing one
+        # out would abandon a request that is mid-generation.
+        bounded = mode == "queue" and not _generation_admitted.get()
+        if bounded and self._generation_waiters >= self._generation_max_queue:
+            # No await between this read and the increment below, so the
+            # count cannot race on a single event loop.
+            self._reject_busy(request_id, "queue_full")
 
         self._generation_waiters += 1
-        acquired = False
         try:
-            async with self._generation_lock:
-                acquired = True
-                self._generation_waiters -= 1
-                yield
+            await self._acquire_generation_lock(
+                request_id,
+                self._generation_queue_timeout_s if bounded else 0.0,
+            )
         finally:
-            if not acquired and self._generation_waiters > 0:
-                self._generation_waiters -= 1
+            # Covers every exit: acquired, timed out, or cancelled.
+            self._generation_waiters -= 1
+
+        _generation_admitted.set(True)
+        self._generation_lock_holder_id = request_id
+        try:
+            yield
+        finally:
+            self._generation_lock_holder_id = None
+            self._generation_lock.release()
 
     def prepare_for_start(self) -> None:
         """Load the backing model off the serving event loop."""
@@ -1252,34 +1409,60 @@ class SimpleEngine(BaseEngine):
             if self._text_model is None and not has_media_content(messages):
                 local_kwargs = mllm_call_kwargs()
 
-                async with self._generation_lock:
-                    _bind_worker_generation_streams()
-                    for chunk in self._model.stream_chat(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        tools=template_tools,
-                        **local_kwargs,
-                    ):
-                        token_count += 1
-                        new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                        accumulated_text += new_text
+                # Go through admission control rather than taking the lock
+                # raw: otherwise this holder is invisible to /v1/status and to
+                # the busy diagnostics, and it bypasses the queue policy.
+                slot_id = f"simple-mllm-text-{id(messages):x}"
+                async with self._acquire_generation_slot(slot_id):
+                    self._active_requests[slot_id] = {
+                        "request_id": slot_id,
+                        "status": "running",
+                        "kind": "stream_chat_text",
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "elapsed_s": 0.0,
+                        "started_at": time.time(),
+                    }
+                    try:
+                        _bind_worker_generation_streams()
+                        for chunk in self._model.stream_chat(
+                            messages=messages,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            tools=template_tools,
+                            **local_kwargs,
+                        ):
+                            token_count += 1
+                            new_text = (
+                                chunk.text if hasattr(chunk, "text") else str(chunk)
+                            )
+                            accumulated_text += new_text
 
-                        finished = chunk.finish_reason is not None
+                            finished = chunk.finish_reason is not None
+                            entry = self._active_requests.get(slot_id)
+                            if entry is not None:
+                                entry["completion_tokens"] = token_count
+                                entry["prompt_tokens"] = getattr(
+                                    chunk, "prompt_tokens", 0
+                                )
 
-                        yield GenerationOutput(
-                            text=accumulated_text,
-                            new_text=new_text,
-                            prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                            completion_tokens=token_count,
-                            finished=finished,
-                            finish_reason=chunk.finish_reason if finished else None,
-                            mtp_drafts=getattr(chunk, "mtp_drafts", 0),
-                            mtp_accepted=getattr(chunk, "mtp_accepted", 0),
-                        )
+                            yield GenerationOutput(
+                                text=accumulated_text,
+                                new_text=new_text,
+                                prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+                                completion_tokens=token_count,
+                                finished=finished,
+                                finish_reason=(
+                                    chunk.finish_reason if finished else None
+                                ),
+                                mtp_drafts=getattr(chunk, "mtp_drafts", 0),
+                                mtp_accepted=getattr(chunk, "mtp_accepted", 0),
+                            )
 
-                        if finished:
-                            break
+                            if finished:
+                                break
+                    finally:
+                        self._active_requests.pop(slot_id, None)
                 return
 
             # Run stream_chat in thread pool since it's synchronous
@@ -2760,7 +2943,13 @@ class SimpleEngine(BaseEngine):
             "generation_lock": {
                 "locked": self._generation_lock.locked(),
                 "admission": self._generation_lock_admission,
+                "max_queue": self._generation_max_queue,
+                "queue_timeout_s": self._generation_queue_timeout_s,
+                "waiting": self._generation_waiters,
+                "holder": self._generation_lock_holder_id,
                 "busy_rejections": self._generation_busy_rejections,
+                "queue_full_rejections": self._generation_queue_full_rejections,
+                "queue_timeout_rejections": self._generation_queue_timeout_rejections,
             },
         }
 

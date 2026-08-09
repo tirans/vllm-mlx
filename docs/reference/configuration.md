@@ -120,11 +120,36 @@ Create `mcp.json`:
 
 ## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `VLLM_MLX_TEST_MODEL` | Default model for tests |
-| `HF_TOKEN` | HuggingFace authentication token |
-| `OPENAI_API_KEY` | Set to any value for SDK compatibility |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `VLLM_MLX_TEST_MODEL` | Default model for tests | — |
+| `HF_TOKEN` | HuggingFace authentication token | — |
+| `OPENAI_API_KEY` | Set to any value for SDK compatibility | — |
+| `VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION` | SimpleEngine admission policy: `queue`, `wait`, or `fail_fast` | `queue` |
+| `VLLM_MLX_SIMPLE_ENGINE_MAX_QUEUE` | Requests allowed to wait for the serialized route before a 503 | `32` |
+| `VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S` | Seconds a request may wait in the queue before a 503 (`0` disables) | `120` |
+| `VLLM_MLX_SIMPLE_ENGINE_RETRY_AFTER_S` | Value advertised in the `Retry-After` header on a 503 | `2` |
+| `VLLM_MLX_SYSTEM_KV_SLOTS` | System-prefix KV cache slots (LRU) | `4` |
+
+### Serialized Engine Admission
+
+SimpleEngine runs one generation at a time: MLX/Metal work must be serialized
+or concurrent command buffers corrupt each other. The admission policy decides
+only what happens to requests that arrive while the route is busy.
+
+- `queue` (default) — the request waits in a bounded FIFO queue. Agent clients
+  that fire overlapping requests (Claude Code and OpenCode both send a small
+  request alongside the main one) simply take their turn. A request is refused
+  only when the queue is full or its wait exceeds the timeout.
+- `wait` — legacy unbounded wait; never refuses.
+- `fail_fast` — legacy behaviour; refuses as soon as the route is occupied.
+
+A refusal is always a retryable **503** carrying `Retry-After`, never a 500.
+Keep `VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S` below the server's `--timeout`
+(default 300s) so a saturated queue returns a clean 503 rather than a 504.
+
+For genuine multi-user concurrency use the batched engine
+(`--continuous-batching`) rather than raising these limits.
 
 ## Example Configurations
 

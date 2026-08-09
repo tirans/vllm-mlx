@@ -38,9 +38,23 @@ class GenerationOutput:
 
 
 class EngineBusy(RuntimeError):
-    """Raised when a serialized engine route is already serving a request."""
+    """Raised when a serialized engine route cannot admit a request."""
 
     code = "text_generation_busy"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "busy",
+        retry_after: float = 1.0,
+    ) -> None:
+        super().__init__(message)
+        # One of "fail_fast", "queue_full", "queue_timeout".
+        self.reason = reason
+        # Retry-After is expressed in whole seconds; keep it >= 1 so a client
+        # that honours the header actually backs off.
+        self.retry_after = max(1, int(round(retry_after)))
 
 
 @contextmanager
