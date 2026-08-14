@@ -6,7 +6,14 @@
   script is INERT: every `.pth` in site-packages carries macOS `UF_HIDDEN`, and CPython 3.13
   skips hidden `.pth` files, so the editable install never registers.
   Permanent fix: `chflags nohidden .venv/lib/python3.13/site-packages/*.pth`
-- `./scripts/serve-qwen3-thinking.sh` — agent-workload server (batched, 256k ctx, warmed).
+- `./run.sh --help` — the model catalog (`models.json`): name, size, context, port, whether
+  the weights are cached. `./run.sh <name>` serves one; `./run.sh --multi a b` serves several
+  on one port; `./run.sh --env <name>` prints the client env vars.
+- Servers started by `run.sh` are named by their **alias**, not the HF repo id — it passes
+  `--served-model-name`, and `server.py:1827` rejects any other name with a 404.
+- `./scripts/serve-qwen3-thinking.sh` is now a shim for `./run.sh reasoning-30b`.
+- `./run.sh --stop --all` kills every listener on a configured port. Check what is running
+  first — it does not ask.
 
 ## Engine gotchas
 

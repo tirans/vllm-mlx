@@ -1,0 +1,116 @@
+{
+  "_comment": [
+    "Model catalog for ./run.sh. Edit this file to add models; run.sh reads it with jq and",
+    "never needs changing. `./run.sh --help` prints the alias list straight from here.",
+    "",
+    "Every key under `defaults` is applied to every model unless the model overrides it.",
+    "`continuous_batching` must stay true: cli.py:252 leaves scheduler_config = None without",
+    "it, so max_num_seqs / cache_memory_mb / every kv_cache_* key is parsed and discarded.",
+    "",
+    "There is deliberately no `downloaded` flag — run.sh probes the cache at runtime so this",
+    "file cannot go stale."
+  ],
+
+  "defaults": {
+    "host": "127.0.0.1",
+    "continuous_batching": true,
+    "max_num_seqs": 4,
+    "cache_memory_mb": 12288,
+    "kv_cache_quantization": true,
+    "kv_cache_quantization_bits": 8,
+    "gpu_memory_utilization": 0.90,
+    "max_tokens": 32768,
+    "caffeinate": true,
+    "warmup": true
+  },
+
+  "multi": {
+    "_comment": [
+      "Used by `--multi` and by the auto-merge path when a port is already busy.",
+      "memory_budget_gb is what makes 'load both, or evict one' a runtime decision:",
+      "models load lazily and are evicted per contention_policy when the budget is tight.",
+      "reasoning_parser/tool_call_parser are PROCESS-GLOBAL — RegisteredModel",
+      "(model_registry.py:145) has no per-model parser fields — so every model merged onto",
+      "one port shares these. run.sh warns when a merged model wanted different ones."
+    ],
+    "port": 8000,
+    "memory_budget_gb": 96,
+    "contention_policy": {
+      "strategy": "wait_then_preempt",
+      "wait_timeout_s": 30
+    },
+    "reasoning_parser": "qwen3",
+    "tool_call_parser": "qwen"
+  },
+
+  "models": {
+    "reasoning-30b": {
+      "label": "Reasoning 30B",
+      "description": "Qwen3-30B-A3B-Thinking-2507, MoE 128x top-8, 8-bit. Best for Claude Code.",
+      "source": "lmstudio-community/Qwen3-30B-A3B-Thinking-2507-MLX-8bit",
+      "port": 8000,
+      "size_gb": 30,
+      "context": 262144,
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen",
+      "enable_auto_tool_choice": true,
+      "max_request_tokens": 262144,
+      "default": true
+    },
+
+    "coder-80b": {
+      "label": "Coder 80B",
+      "description": "Qwen3-Coder-Next, MoE 512x top-10 + shared expert, 4-bit. Code-tuned, 79.7B params.",
+      "source": "/Users/tiran/.lmstudio/models/lmstudio-community/Qwen3-Coder-Next-MLX-4bit",
+      "port": 8001,
+      "size_gb": 42,
+      "context": 262144,
+      "tool_call_parser": "qwen3_coder",
+      "enable_auto_tool_choice": true,
+      "max_request_tokens": 262144
+    },
+
+    "fast-8b": {
+      "label": "Fast Qwen 8B",
+      "description": "Qwen3-8B dense, 4-bit. Quick turns, low memory. Downloads on first use.",
+      "source": "mlx-community/Qwen3-8B-4bit",
+      "port": 8002,
+      "size_gb": 5,
+      "context": 40960,
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen",
+      "enable_auto_tool_choice": true,
+      "max_request_tokens": 40960,
+      "max_tokens": 16384
+    },
+
+    "tiny-1b": {
+      "label": "Tiny Llama 1B",
+      "description": "Llama-3.2-1B-Instruct, 4-bit. Cheap helper model — good ANTHROPIC_SMALL_FAST_MODEL.",
+      "source": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+      "port": 8010,
+      "size_gb": 1,
+      "context": 131072,
+      "tool_call_parser": "llama",
+      "enable_auto_tool_choice": true,
+      "max_request_tokens": 131072,
+      "max_tokens": 8192,
+      "cache_memory_mb": 2048
+    },
+
+    "tiny-0.6b": {
+      "label": "Tiny Qwen 0.6B",
+      "description": "Qwen3-0.6B, 8-bit. Smallest — loads in seconds, use it to smoke-test the stack.",
+      "source": "mlx-community/Qwen3-0.6B-8bit",
+      "port": 8011,
+      "size_gb": 1,
+      "context": 40960,
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen",
+      "enable_auto_tool_choice": true,
+      "max_request_tokens": 40960,
+      "max_tokens": 8192,
+      "cache_memory_mb": 2048
+    }
+  }
+}

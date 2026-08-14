@@ -3,13 +3,14 @@
 # weights, verify the snapshot, and optionally hand straight over to the server.
 #
 #   ./scripts/setup.sh                  sync deps + download the default model
-#   ./scripts/setup.sh --serve          ... then exec serve-qwen3-thinking.sh
+#   ./scripts/setup.sh --serve          ... then exec ./run.sh reasoning-30b
 #   ./scripts/setup.sh --serve --repro  ... serving with --disable-prefix-cache
 #   MODEL=<repo/id> ./scripts/setup.sh  a different checkpoint
 #
-# Why a separate script from serve-qwen3-thinking.sh: that one refuses to start
-# on an incomplete snapshot and tells you to run `hf download`. This is that
-# step, made explicit, so a fresh machine is two commands instead of a puzzle.
+# Day-to-day model management lives in ./run.sh and ./models.json — `./run.sh --help`
+# lists every model with its size, context and port, and run.sh downloads a model
+# on first use. This script is the once-per-machine step: it also creates the venv
+# and clears the UF_HIDDEN flag that makes the editable install inert.
 #
 # --repro exists because the prefix cache is the measured cause of the model's
 # non-reproducibility: for one byte-identical prompt at temperature 0 the server
@@ -52,7 +53,9 @@ note "syncing the venv ..."
 # never registers and the `vllm-mlx` console script is inert. Clearing the flag is
 # the permanent fix; PYTHONPATH is the workaround the serve script already uses.
 SITE_PACKAGES="$("$PY" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
-if [[ -n "$SITE_PACKAGES" ]] && ls -lO "$SITE_PACKAGES"/*.pth 2>/dev/null | grep -q hidden; then
+# stat -f '%Sf' prints the BSD file flags directly. `ls -lO | grep hidden` also works
+# but parses a column out of ls, and one of these filenames contains a space.
+if [[ -n "$SITE_PACKAGES" ]] && stat -f '%Sf' "$SITE_PACKAGES"/*.pth 2>/dev/null | grep -q hidden; then
   note "clearing UF_HIDDEN on $SITE_PACKAGES/*.pth ..."
   chflags nohidden "$SITE_PACKAGES"/*.pth || warn "chflags failed; PYTHONPATH will still work"
 fi
@@ -85,12 +88,14 @@ fi
 # --- 3. run ------------------------------------------------------------------
 
 if [[ $SERVE -eq 0 ]]; then
-  note "done. start the server with:"
-  note "    ./scripts/serve-qwen3-thinking.sh                        (fast, prefix cache on)"
-  note "    ./scripts/serve-qwen3-thinking.sh --disable-prefix-cache (reproducible)"
+  note "done. see what you can serve:"
+  note "    ./run.sh --help"
+  note "then start one:"
+  note "    ./run.sh reasoning-30b                        (fast, prefix cache on)"
+  note "    ./run.sh reasoning-30b --disable-prefix-cache (reproducible)"
   exit 0
 fi
 
 FLAGS=()
 [[ $REPRO -eq 1 ]] && FLAGS+=(--disable-prefix-cache)
-exec "$REPO/scripts/serve-qwen3-thinking.sh" ${FLAGS[@]+"${FLAGS[@]}"}
+exec "$REPO/run.sh" reasoning-30b ${FLAGS[@]+"${FLAGS[@]}"}
