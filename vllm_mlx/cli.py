@@ -1340,34 +1340,22 @@ Examples:
         action="store_true",
         help="Enable auto tool choice for supported models. Use --tool-call-parser to specify which parser to use.",
     )
+    # Tool call parser choices - loaded dynamically from registry (mirrors
+    # --reasoning-parser below). A hardcoded list here previously drifted out of
+    # sync with vllm_mlx/tool_parsers/*.py's @register_module names — e.g. "qwen3.5"
+    # and "qwen3_xml" were registered but missing from this list, so any model
+    # configured to use them failed argparse before the server could even start.
+    from .tool_parsers import ToolParserManager
+
+    tool_call_choices = ToolParserManager.list_registered()
     serve_parser.add_argument(
         "--tool-call-parser",
         type=str,
         default=None,
-        choices=[
-            "auto",
-            "mistral",
-            "qwen",
-            "qwen3_coder",
-            "llama",
-            "hermes",
-            "harmony",
-            "gpt-oss",
-            "deepseek",
-            "kimi",
-            "granite",
-            "nemotron",
-            "xlam",
-            "functionary",
-            "gemma4",
-            "glm47",
-            "minimax",
-        ],
+        choices=tool_call_choices,
         help=(
-            "Select the tool call parser for the model. Options: "
-            "auto (auto-detect), mistral, qwen, qwen3_coder, llama, hermes, "
-            "harmony, gpt-oss, deepseek, gemma4, kimi, granite, nemotron, "
-            "xlam, functionary, glm47, minimax. "
+            "Select the tool call parser for the model. "
+            f"Options: {', '.join(tool_call_choices)}. "
             "Required for --enable-auto-tool-choice."
         ),
     )

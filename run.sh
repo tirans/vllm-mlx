@@ -548,14 +548,22 @@ serve_multi() {
   # per-model reasoning_parser / tool_call_parser. Everything merged onto one port
   # shares the .multi block's pair, so say so when a model wanted something else.
   local mrp mtp
-  mrp="$(multiget reasoning_parser)"
-  mtp="$(multiget tool_call_parser)"
-  for a in "${sel[@]}"; do
-    local rp tp
-    rp="$(mget "$a" reasoning_parser)"; tp="$(mget "$a" tool_call_parser)"
-    [[ -n "$rp" && "$rp" != "$mrp" ]] && warn "$a wants --reasoning-parser $rp but shares '$mrp' on a merged port"
-    [[ -n "$tp" && "$tp" != "$mtp" ]] && warn "$a wants --tool-call-parser $tp but shares '$mtp' on a merged port"
-  done
+  if [[ ${#sel[@]} -eq 1 ]]; then
+    # Nothing is actually being shared — a merge that dropped every other occupant,
+    # or an explicit `--multi` with one alias, should behave like a plain single-
+    # model serve: its own parsers, not the (possibly stale) .multi block's.
+    mrp="$(mget "${sel[0]}" reasoning_parser)"
+    mtp="$(mget "${sel[0]}" tool_call_parser)"
+  else
+    mrp="$(multiget reasoning_parser)"
+    mtp="$(multiget tool_call_parser)"
+    for a in "${sel[@]}"; do
+      local rp tp
+      rp="$(mget "$a" reasoning_parser)"; tp="$(mget "$a" tool_call_parser)"
+      [[ -n "$rp" && "$rp" != "$mrp" ]] && warn "$a wants --reasoning-parser $rp but shares '$mrp' on a merged port"
+      [[ -n "$tp" && "$tp" != "$mtp" ]] && warn "$a wants --tool-call-parser $tp but shares '$mtp' on a merged port"
+    done
+  fi
 
   local all_offline=1 max_req=0 max_tok=0
   for a in "${sel[@]}"; do
@@ -581,7 +589,11 @@ serve_multi() {
         },
         models: [ $ARGS.positional[] as $a
                   | $c.models[$a]
-                  | { name: $a, source: .source, preload: false,
+                  # A single-model registry has nothing to lazy-load for — preload it
+                  # so /health and the readiness reporter above stay honest about
+                  # residency. Real merges (2+) keep lazy per-request loading.
+                  | { name: $a, source: .source,
+                      preload: (($ARGS.positional | length) == 1),
                       estimated_memory_gb: (.size_gb // 8) } ] }
   ' "${sel[@]}" > "$reg"
   note "registry: $reg"
