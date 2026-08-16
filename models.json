@@ -48,11 +48,24 @@
       "label": "Reasoning 30B",
       "description": "Qwen3-30B-A3B-Thinking-2507, MoE 128x top-8, 8-bit. Best for Claude Code.",
       "source": "lmstudio-community/Qwen3-30B-A3B-Thinking-2507-MLX-8bit",
-      "port": 8000,
+      "port": 8003,
       "size_gb": 30,
       "context": 262144,
       "reasoning_parser": "qwen3",
       "tool_call_parser": "qwen",
+      "enable_auto_tool_choice": true,
+      "max_request_tokens": 262144
+    },
+
+    "qwen3.8-27b": {
+      "label": "Qwen3.8 27B",
+      "description": "Qwen3.8-27B, dense hybrid (Gated DeltaNet + Gated Attention), 8-bit. VLM text tower served via build_text_model.",
+      "source": "mlx-community/Qwen3.8-27B-8bit",
+      "port": 8000,
+      "size_gb": 28,
+      "context": 262144,
+      "reasoning_parser": "qwen3",
+      "tool_call_parser": "qwen3.5",
       "enable_auto_tool_choice": true,
       "max_request_tokens": 262144,
       "default": true

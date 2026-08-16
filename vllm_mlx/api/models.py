@@ -340,6 +340,10 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "vllm-mlx"
+    #: The full model id/path `id` was served under (e.g. a `--served-model-name`
+    #: alias's real HF repo id) — what this process actually downloaded and loaded.
+    #: None when `id` already is the real name (embedding/rerank engines).
+    source: str | None = None
 
 
 class ModelsResponse(BaseModel):

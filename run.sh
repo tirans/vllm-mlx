@@ -191,6 +191,7 @@ print_help() {
   vllm-mlx launcher — models come from $(basename "$CONFIG")
 
   usage:
+    ./run.sh                             serve the default (marked *, below)
     ./run.sh <name> [serve flags...]     serve one model
     ./run.sh --multi <name> [<name>...]  serve several on one port (lazy-loaded)
     ./run.sh --multi --all               ... every downloaded model
@@ -734,7 +735,17 @@ if (( WANT_ALL == 1 )) && [[ "$MODE" == "multi" ]]; then
   [[ ${#SEL[@]} -gt 0 ]] || die "no downloaded models to serve"
 fi
 
-[[ ${#SEL[@]} -gt 0 ]] || { print_help; exit 0; }
+if [[ ${#SEL[@]} -eq 0 ]]; then
+  if [[ "$MODE" == "serve" ]]; then
+    # Bare `./run.sh`: serve the catalog default rather than just printing help —
+    # "default": true in models.json should actually mean something.
+    SEL=("$(default_alias)")
+    note "no model given — serving the default: ${SEL[0]}"
+  else
+    print_help
+    exit 0
+  fi
+fi
 for a in "${SEL[@]}"; do has_alias "$a" || die "unknown model: $a (try ./run.sh --help)"; done
 
 case "$MODE" in

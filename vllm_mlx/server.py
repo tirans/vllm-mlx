@@ -3812,9 +3812,12 @@ async def list_models() -> ModelsResponse:
     """List available models."""
     models = []
     if _model_manager is not None:
-        models.extend(ModelInfo(id=item["id"]) for item in _model_manager.list_models())
+        models.extend(
+            ModelInfo(id=item["id"], source=item.get("source"))
+            for item in _model_manager.list_models()
+        )
     elif _model_name:
-        models.append(ModelInfo(id=_model_name))
+        models.append(ModelInfo(id=_model_name, source=_model_path))
     if _embedding_engine is not None:
         models.append(
             ModelInfo(id=_embedding_engine.model_name, owned_by="vllm-mlx-embedding")
