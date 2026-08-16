@@ -3575,6 +3575,26 @@ async def health():
     return payload
 
 
+@app.get("/api/status")
+async def api_status():
+    """Unauthenticated status alias for external monitors (e.g. menu-bar apps)
+
+    that poll a generic `/api/status` path instead of this server's `/health`
+    or `/v1/status` routes.
+    """
+    return await health()
+
+
+@app.get("/admin/api/activity")
+async def admin_api_activity():
+    """Unauthenticated stub for external monitors polling for recent activity.
+
+    This server doesn't keep an activity log; an empty list is the honest answer
+    and stops the poller's 404 spam.
+    """
+    return {"activity": []}
+
+
 @app.get("/v1/status", dependencies=[Depends(verify_api_key)])
 async def status():
     """Real-time status with per-request details for debugging and monitoring."""
