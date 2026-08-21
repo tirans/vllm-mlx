@@ -3813,7 +3813,9 @@ async def list_models() -> ModelsResponse:
     models = []
     if _model_manager is not None:
         models.extend(
-            ModelInfo(id=item["id"], source=item.get("source"))
+            ModelInfo(
+                id=item["id"], source=item.get("source"), loaded=item.get("loaded", False)
+            )
             for item in _model_manager.list_models()
         )
     elif _model_name:

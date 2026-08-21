@@ -5,9 +5,16 @@
 This mode is designed for Apple Silicon machines where unified memory is the main constraint:
 
 - models load lazily on first use
-- idle models are evicted with an LRU policy under a memory budget
+- idle models are evicted priority-first, then LRU within a priority tier, under a memory budget and/or a resident-model count cap (`max_resident_models`)
 - contention can be configured to wait, fail fast, or preempt active models
-- `/v1/models` reflects the configured registry instead of a single default model
+- `/v1/models` lists every registered model, loaded or not, instead of only what's currently resident
+
+`run.sh`'s default single-model dispatch (bare `./run.sh <name>`, no `--pin`) is
+registry-backed too, with `max_resident_models: 1` — exactly one model resident
+at a time, but any catalog alias a client requests gets swapped in (downloading
+first if needed) instead of 404ing. Pass `--pin` for the old, hard-pinned
+single-model behavior: no registry, no catalog, 404 on anything but the one
+alias it was started with.
 
 ## When to Use It
 
@@ -93,6 +100,22 @@ This is the eviction budget, not the full system RAM size. Leave headroom for:
 
 On a 128 GB machine, a practical starting point is often `80-100 GB`.
 
+### `max_resident_models`
+
+An optional second cap alongside `memory_budget_gb`, expressed as a count rather
+than bytes. When set, the manager evicts down to this many resident models
+before satisfying a new load, even if the byte budget would otherwise allow
+more to stay resident.
+
+Set it to `1` to force "exactly one model resident at a time, whichever was
+requested most recently" — this is what `vllm-mlx`'s `run.sh` uses for its
+default single-model dispatch (elastic single: one resident model, swapped on
+request, instead of a fixed pin). Leave it unset for pure budget-gated
+eviction.
+
+At most `max_resident_models` registry entries may set `preload: true` —
+startup rejects a config where more entries would preload than the cap allows.
+
 ### `contention_policy`
 
 Controls what happens when a request needs a model that does not currently fit.
@@ -132,6 +155,11 @@ Optional:
 - `stream_interval`
 - `gpu_memory_utilization`
 - `estimated_memory_gb`
+- `priority`: eviction weight, default `0`. When capacity is needed (either the
+  byte budget or `max_resident_models`), the lowest-priority idle/active
+  resident is evicted first; idle time only breaks ties within the same
+  priority tier — it no longer decides eviction order on its own the way pure
+  LRU did.
 
 ## Sizing Rules
 

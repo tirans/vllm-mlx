@@ -104,6 +104,8 @@ mget() {
 
 multiget() { jq -r --arg k "$1" '(.multi // {})[$k] // empty' "$CONFIG"; }
 
+default_multi() { jq -r '(.multi.default_multi // [])[]' "$CONFIG"; }
+
 default_alias() {
   jq -r 'first((.models | to_entries[] | select(.value.default == true) | .key), (.models | keys_unsorted[0]))' "$CONFIG"
 }
@@ -191,13 +193,20 @@ print_help() {
   vllm-mlx launcher — models come from $(basename "$CONFIG")
 
   usage:
-    ./run.sh                             serve the default (marked *, below)
-    ./run.sh <name> [serve flags...]     serve one model
+    ./run.sh                             serve the default (marked *, below) — elastic single
+    ./run.sh <name> [serve flags...]     serve one model — elastic single (see below)
+    ./run.sh --pin <name> [serve flags...]  serve one model, hard-pinned (no swap, no registry)
     ./run.sh --multi <name> [<name>...]  serve several on one port (lazy-loaded)
     ./run.sh --multi --all               ... every downloaded model
     ./run.sh --env <name>                print client env vars
     ./run.sh --stop <name>|--all         stop a running server
     ./run.sh --list                      machine-readable catalog (TSV)
+
+  "elastic single": exactly one model resident at a time, but every catalog
+  model is registered and reachable — a request naming a different alias
+  unloads the current one and loads (downloading if needed) the requested one
+  instead of 404ing. --pin keeps the old behavior: no registry, 404 on any name
+  but the one given, for the smallest possible operational footprint.
 
   options:
     --port N        override the model's configured port
@@ -535,6 +544,11 @@ serve_single() {
 
 # --- multi-model serve -------------------------------------------------------
 
+# Set by callers before invoking serve_multi to force a resident-model cap
+# (e.g. "1" for elastic single-model dispatch) regardless of what
+# .multi.max_resident_models says. Empty means "use the config value as-is".
+MAX_RESIDENT_OVERRIDE="${MAX_RESIDENT_OVERRIDE:-}"
+
 serve_multi() {
   local port="$1"; shift
   local sel=() a
@@ -544,34 +558,44 @@ serve_multi() {
   local host; host="${HOST:-$(mget "${sel[0]}" host)}"
   preflight
 
-  # Parsers are process-global: RegisteredModel (model_registry.py:145) has no
-  # per-model reasoning_parser / tool_call_parser. Everything merged onto one port
-  # shares the .multi block's pair, so say so when a model wanted something else.
+  # Every catalog alias is registered on this port now (see the jq below), not
+  # just the ones named here — any of them can load lazily on request. Parsers
+  # are process-global though: RegisteredModel (model_registry.py:145) has no
+  # per-model reasoning_parser / tool_call_parser, so whichever model actually
+  # ends up resident shares whatever this process started with.
   local mrp mtp
   if [[ ${#sel[@]} -eq 1 ]]; then
-    # Nothing is actually being shared — a merge that dropped every other occupant,
-    # or an explicit `--multi` with one alias, should behave like a plain single-
-    # model serve: its own parsers, not the (possibly stale) .multi block's.
+    # Only one alias was asked for on this invocation (elastic single-model
+    # dispatch, or an explicit `--multi` with one name) — use its own parsers,
+    # not the (possibly mismatched) .multi block's. Other catalog aliases can
+    # still load later if requested, but will run under THIS alias's parser
+    # choice, not their own, until the process restarts on a different one.
     mrp="$(mget "${sel[0]}" reasoning_parser)"
     mtp="$(mget "${sel[0]}" tool_call_parser)"
   else
     mrp="$(multiget reasoning_parser)"
     mtp="$(multiget tool_call_parser)"
-    for a in "${sel[@]}"; do
+    while IFS= read -r a; do
       local rp tp
       rp="$(mget "$a" reasoning_parser)"; tp="$(mget "$a" tool_call_parser)"
       [[ -n "$rp" && "$rp" != "$mrp" ]] && warn "$a wants --reasoning-parser $rp but shares '$mrp' on a merged port"
       [[ -n "$tp" && "$tp" != "$mtp" ]] && warn "$a wants --tool-call-parser $tp but shares '$mtp' on a merged port"
-    done
+    done < <(aliases)
   fi
 
-  local all_offline=1 max_req=0 max_tok=0
+  local all_offline=1
   for a in "${sel[@]}"; do
     [[ "$(ensure_weights "$a")" == "offline" ]] || all_offline=0
+  done
+
+  # Sized across the WHOLE catalog, not just $sel — any registered alias can
+  # load lazily later, and the server-wide token ceilings must cover it too.
+  local max_req=0 max_tok=0
+  while IFS= read -r a; do
     local mr mt
     mr="$(mget "$a" max_request_tokens)"; (( mr > max_req )) && max_req=$mr
     mt="$(mget "$a" max_tokens)";         (( mt > max_tok )) && max_tok=$mt
-  done
+  done < <(aliases)
   (( max_tok > max_req )) && max_tok=$max_req
 
   init_kv_flags "${sel[0]}"
@@ -581,20 +605,30 @@ serve_multi() {
   # is a superset of JSON, so a plain JSON document is a valid registry file. No
   # YAML emitter needed. Shape validated against load_registry_config.
   local reg="${TMPDIR:-/tmp}/vllm-mlx-registry-$port.json"
-  jq -n --slurpfile cfg "$CONFIG" --args '
+  jq -n --slurpfile cfg "$CONFIG" --arg max_resident "$MAX_RESIDENT_OVERRIDE" --args '
     $cfg[0] as $c
+    | ($ARGS.positional) as $sel
     | { manager: {
           memory_budget_gb: ($c.multi.memory_budget_gb // 64),
-          contention_policy: ($c.multi.contention_policy // {strategy: "wait_then_fail"})
+          contention_policy: ($c.multi.contention_policy // {strategy: "wait_then_fail"}),
+          max_resident_models: (
+            if $max_resident != "" then ($max_resident | tonumber)
+            else ($c.multi.max_resident_models // null) end
+          )
         },
-        models: [ $ARGS.positional[] as $a
+        # The whole catalog is registered here, not just $sel — every alias
+        # becomes reachable/downloadable on request (loaded: false until then),
+        # which is what makes /v1/models able to list every known model and
+        # what lets a client ask for anything in the catalog without a restart.
+        models: [ $c.models | keys_unsorted[] as $a
                   | $c.models[$a]
-                  # A single-model registry has nothing to lazy-load for — preload it
-                  # so /health and the readiness reporter above stay honest about
-                  # residency. Real merges (2+) keep lazy per-request loading.
+                  # Only the aliases explicitly named on this invocation may
+                  # preload — and only when exactly one was named, matching the
+                  # single-model-registry-has-nothing-to-lazy-load-for case.
                   | { name: $a, source: .source,
-                      preload: (($ARGS.positional | length) == 1),
-                      estimated_memory_gb: (.size_gb // 8) } ] }
+                      preload: (($sel | index($a)) != null and ($sel | length) == 1),
+                      estimated_memory_gb: (.size_gb // 8),
+                      priority: (.priority // $c.defaults.priority // 0) } ] }
   ' "${sel[@]}" > "$reg"
   note "registry: $reg"
 
@@ -615,9 +649,11 @@ serve_multi() {
 
   # Only the first model is warmed: the rest load lazily on their first request,
   # and warming them all would defeat the memory budget by making them all resident.
+  local mr_display="${MAX_RESIDENT_OVERRIDE:-$(multiget max_resident_models)}"
+  [[ -n "$mr_display" ]] || mr_display="unbounded"
   start_reporter "$host" "$port" "${sel[0]}" 1
   note "starting ${#sel[@]} models on http://$host:$port — ${sel[*]}"
-  note "  '${sel[0]}' loads now; the rest load on first use, budget $(multiget memory_budget_gb) GB, policy $(jq -r '.multi.contention_policy.strategy' "$CONFIG")"
+  note "  '${sel[0]}' loads now; the rest of the catalog loads on first use, budget $(multiget memory_budget_gb) GB, max resident $mr_display, policy $(jq -r '.multi.contention_policy.strategy' "$CONFIG")"
   launch "${args[@]}" "$@"
 }
 
@@ -698,6 +734,7 @@ MODE=serve
 PORT_OVERRIDE=""
 NO_MERGE=0
 WANT_ALL=0
+PIN=0
 SEL=()
 EXTRA=()
 
@@ -710,6 +747,10 @@ while [[ $# -gt 0 ]]; do
     --multi)     MODE=multi; shift ;;
     --all)       WANT_ALL=1; shift ;;
     --no-merge)  NO_MERGE=1; shift ;;
+    # Legacy hard-pinned single-model serve: no registry, no catalog, 404 on any
+    # other name — the "backup / resource-limited" mode. Without this flag,
+    # `serve` dispatches through the registry (one resident model, swappable).
+    --pin)       PIN=1; shift ;;
     --port)      [[ -n "${2:-}" ]] || die "--port needs a value"; PORT_OVERRIDE="$2"; shift 2 ;;
     --)          shift; EXTRA+=("$@"); break ;;
     # First flag run.sh doesn't know ends its own parsing; the rest is the
@@ -747,10 +788,22 @@ if (( WANT_ALL == 1 )) && [[ "$MODE" == "multi" ]]; then
   [[ ${#SEL[@]} -gt 0 ]] || die "no downloaded models to serve"
 fi
 
+if [[ "$MODE" == "multi" ]] && [[ ${#SEL[@]} -eq 0 ]] && (( WANT_ALL == 0 )); then
+  # `--multi` with no names: fall back to .multi.default_multi (the set a local
+  # client like Prism actually requests across its rungs) instead of dying.
+  while IFS= read -r a; do
+    [[ -n "$a" ]] && SEL+=("$a")
+  done < <(default_multi)
+  [[ ${#SEL[@]} -gt 0 ]] && note "--multi given no names — using the configured default set: ${SEL[*]}"
+fi
+
 if [[ ${#SEL[@]} -eq 0 ]]; then
   if [[ "$MODE" == "serve" ]]; then
     # Bare `./run.sh`: serve the catalog default rather than just printing help —
-    # "default": true in models.json should actually mean something.
+    # "default": true in models.json should actually mean something. One
+    # resident model at a time (elastic single, see below) — not
+    # `.multi.default_multi`'s whole set — to avoid the GPU-utilization/Metal-
+    # buffer-cache cost of holding more than one model resident by default.
     SEL=("$(default_alias)")
     note "no model given — serving the default: ${SEL[0]}"
   else
@@ -775,6 +828,21 @@ case "$MODE" in
     ;;
   serve)
     [[ ${#SEL[@]} -eq 1 ]] || die "serve takes one model name — did you mean --multi ${SEL[*]}?"
-    merge_or_start "${SEL[0]}" ${EXTRA[@]+"${EXTRA[@]}"}
+    if (( PIN == 1 )); then
+      merge_or_start "${SEL[0]}" ${EXTRA[@]+"${EXTRA[@]}"}
+    else
+      # Elastic single: one resident model, backed by the same registry as
+      # --multi (with the whole catalog reachable) but capped to exactly one
+      # resident model — a request for a different catalog alias unloads the
+      # current one and loads the requested one instead of 404ing. No merge
+      # logic: if the port is already serving anything, whatever it's running
+      # already carries the full catalog (registry mode always does now), so
+      # there's nothing to merge — just point clients at it, or stop it first.
+      MP="${PORT_OVERRIDE:-${PORT:-$(mget "${SEL[0]}" port)}}"
+      if [[ -n "$(port_pids "$MP")" ]]; then
+        die "port $MP is already in use — ./run.sh --stop --all first"
+      fi
+      MAX_RESIDENT_OVERRIDE=1 serve_multi "$MP" "${SEL[@]}" -- ${EXTRA[@]+"${EXTRA[@]}"}
+    fi
     ;;
 esac

@@ -21,20 +21,41 @@
     "gpu_memory_utilization": 0.90,
     "max_tokens": 32768,
     "caffeinate": true,
-    "warmup": true
+    "warmup": true,
+    "priority": 0
   },
 
   "multi": {
     "_comment": [
-      "Used by `--multi` and by the auto-merge path when a port is already busy.",
+      "Used by `--multi`, by the auto-merge path when a port is already busy, and by",
+      "bare `./run.sh <name>` (elastic single-model serve, capped to one resident model —",
+      "see max_resident_models below). Every catalog alias is ALWAYS registered on the",
+      "port, not just the ones named on the command line — any of them can load lazily",
+      "on request (downloading first if needed), which is what makes /v1/models list the",
+      "whole catalog and what lets a client ask for anything without a restart.",
+      "",
       "memory_budget_gb is what makes 'load both, or evict one' a runtime decision:",
       "models load lazily and are evicted per contention_policy when the budget is tight.",
+      "max_resident_models is a second, count-based cap alongside the byte budget — set",
+      "to 1 to force exactly one resident model regardless of how much budget is left",
+      "(that's what bare `./run.sh <name>` uses); leave null/omitted for `--multi` so it",
+      "stays purely budget-gated as before. Eviction picks the lowest-`priority` resident",
+      "model first (models.json per-entry `priority`, default 0 via `defaults`), idle time",
+      "only breaks ties within the same priority.",
       "reasoning_parser/tool_call_parser are PROCESS-GLOBAL — RegisteredModel",
       "(model_registry.py:145) has no per-model parser fields — so every model merged onto",
-      "one port shares these. run.sh warns when a merged model wanted different ones."
+      "one port shares these. run.sh warns when a merged model wanted different ones.",
+      "",
+      "default_multi is what `./run.sh --multi` (no names given) falls back to — every",
+      "alias a local client (e.g. Prism, config at ~/.config/prism/llm.env) actually",
+      "requests. It no longer drives the bare-invocation default (that's elastic single,",
+      "one resident model at a time, on `default: true` below) — two models concurrently",
+      "resident measurably capped GPU utilization, so bare `./run.sh` went back to one."
     ],
     "port": 8000,
     "memory_budget_gb": 96,
+    "max_resident_models": null,
+    "default_multi": ["reasoning-30b", "qwen3.8-27b"],
     "contention_policy": {
       "strategy": "wait_then_preempt",
       "wait_timeout_s": 30
@@ -54,7 +75,8 @@
       "reasoning_parser": "qwen3",
       "tool_call_parser": "qwen",
       "enable_auto_tool_choice": true,
-      "max_request_tokens": 262144
+      "max_request_tokens": 262144,
+      "priority": 10
     },
 
     "qwen3.8-27b": {
@@ -68,7 +90,8 @@
       "tool_call_parser": "qwen3.5",
       "enable_auto_tool_choice": true,
       "max_request_tokens": 262144,
-      "default": true
+      "default": true,
+      "priority": 10
     },
 
     "coder-80b": {

@@ -139,6 +139,7 @@ class RegistryManagerConfig:
 
     memory_budget_bytes: int
     policy: ContentionPolicy
+    max_resident_models: int | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,7 @@ class RegisteredModel:
     stream_interval: int | None = None
     gpu_memory_utilization: float | None = None
     estimated_memory_bytes: int | None = None
+    priority: int = 0
 
 
 @dataclass(frozen=True)
@@ -315,11 +317,15 @@ def load_registry_config(
     }:
         raise ValueError(f"Unsupported contention strategy: {policy.strategy}")
 
+    max_resident_models = manager_raw.get("max_resident_models")
     manager = RegistryManagerConfig(
         memory_budget_bytes=_parse_memory_budget_bytes(
             manager_raw.get("memory_budget_gb", manager_raw.get("memory_budget"))
         ),
         policy=policy,
+        max_resident_models=(
+            int(max_resident_models) if max_resident_models is not None else None
+        ),
     )
 
     registry: dict[str, RegisteredModel] = {}
@@ -356,7 +362,18 @@ def load_registry_config(
             stream_interval=item.get("stream_interval"),
             gpu_memory_utilization=item.get("gpu_memory_utilization"),
             estimated_memory_bytes=estimated_bytes,
+            priority=int(item.get("priority", 0)),
         )
+
+    if manager.max_resident_models is not None:
+        preload_count = sum(1 for m in registry.values() if m.preload)
+        if preload_count > manager.max_resident_models:
+            raise ValueError(
+                f"models-config has {preload_count} preload=true entries but "
+                f"manager.max_resident_models={manager.max_resident_models} — "
+                "at most max_resident_models entries may preload, or the first "
+                "preload would immediately evict another."
+            )
 
     return manager, registry
 
@@ -422,16 +439,26 @@ class ModelManager:
                     )
                 )
             )
-            data.append(
-                {
-                    "id": name,
-                    "status": state,
-                    "loaded": loaded is not None,
-                    "owned_by": "vllm-mlx",
-                    "source": entry.source,
-                    "memory_gb": round(estimated / (1024**3), 2) if estimated else None,
-                }
-            )
+            entry_data = {
+                "id": name,
+                "status": state,
+                "loaded": loaded is not None,
+                "owned_by": "vllm-mlx",
+                "source": entry.source,
+                "memory_gb": round(estimated / (1024**3), 2) if estimated else None,
+            }
+            if loaded is not None:
+                # Per-request telemetry, absent for a merely-resident-but-idle model:
+                # a caller polling /v1/status needs a way to tell "generating" apart
+                # from "silently stalled" without shelling in to check GPU usage.
+                engine_stats = loaded.engine.get_stats()
+                entry_data["active_requests"] = loaded.active_requests
+                entry_data["num_running"] = engine_stats.get("num_running", 0)
+                entry_data["num_waiting"] = engine_stats.get("num_waiting", 0)
+                entry_data["generation_tps"] = engine_stats.get("batch_generator", {}).get(
+                    "generation_tps", 0
+                )
+            data.append(entry_data)
         return data
 
     async def preload(self) -> None:
@@ -506,7 +533,11 @@ class ModelManager:
                     unloads = self._collect_idle_unloads_locked(
                         model_name, required_bytes
                     )
-                    if not unloads and self._can_reserve_locked(required_bytes):
+                    if (
+                        not unloads
+                        and self._can_reserve_locked(required_bytes)
+                        and self._fits_resident_cap_locked()
+                    ):
                         load = self._reserve_load_locked(model_name, required_bytes)
                     elif not unloads:
                         cancel_tasks = self._maybe_preempt_locked(
@@ -686,20 +717,30 @@ class ModelManager:
     ) -> list[LoadedModel]:
         selected: list[LoadedModel] = []
         projected_bytes = self._committed_bytes_locked()
+        max_resident = self._config.max_resident_models
+        # +1: the requested model itself will become resident once this settles.
+        projected_count = len(self._loaded) + 1
         candidates = sorted(
             (
                 loaded
                 for name, loaded in self._loaded.items()
                 if name != requested_model and loaded.active_requests == 0
             ),
-            key=lambda item: item.last_used_at,
+            # Lowest priority evicted first; idle time only breaks ties within a
+            # priority tier, it no longer decides eviction order on its own.
+            key=lambda item: (item.config.entry.priority, item.last_used_at),
         )
 
         for loaded in candidates:
-            if projected_bytes + required_bytes <= self._config.memory_budget_bytes:
+            fits_budget = (
+                projected_bytes + required_bytes <= self._config.memory_budget_bytes
+            )
+            fits_count = max_resident is None or projected_count <= max_resident
+            if fits_budget and fits_count:
                 break
             selected.append(self._begin_unload_locked(loaded.config.entry.name))
             projected_bytes -= loaded.config.estimated_memory_bytes
+            projected_count -= 1
 
         return selected
 
@@ -715,24 +756,32 @@ class ModelManager:
 
         cancel_tasks: set[asyncio.Task[Any]] = set()
         projected_bytes = self._committed_bytes_locked()
+        max_resident = self._config.max_resident_models
+        projected_count = len(self._loaded) + 1
         candidates = sorted(
             (
                 loaded
                 for name, loaded in self._loaded.items()
                 if name != model_name and loaded.active_requests > 0
             ),
-            key=lambda item: item.last_used_at,
+            key=lambda item: (item.config.entry.priority, item.last_used_at),
         )
 
         for loaded in candidates:
-            if projected_bytes + required_bytes <= self._config.memory_budget_bytes:
+            fits_budget = (
+                projected_bytes + required_bytes <= self._config.memory_budget_bytes
+            )
+            fits_count = max_resident is None or projected_count <= max_resident
+            if fits_budget and fits_count:
                 break
             if loaded.preempting:
                 projected_bytes -= loaded.config.estimated_memory_bytes
+                projected_count -= 1
                 continue
             loaded.preempting = True
             cancel_tasks.update(loaded.active_tasks)
             projected_bytes -= loaded.config.estimated_memory_bytes
+            projected_count -= 1
 
         if cancel_tasks:
             self._condition.notify_all()
@@ -766,6 +815,13 @@ class ModelManager:
             self._committed_bytes_locked() + required_bytes
             <= self._config.memory_budget_bytes
         )
+
+    def _fits_resident_cap_locked(self) -> bool:
+        max_resident = self._config.max_resident_models
+        if max_resident is None:
+            return True
+        # +1: the model about to be reserved will itself become resident.
+        return len(self._loaded) + len(self._loading) + 1 <= max_resident
 
     def _committed_bytes_locked(self) -> int:
         loaded_bytes = sum(

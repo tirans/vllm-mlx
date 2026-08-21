@@ -344,6 +344,12 @@ class ModelInfo(BaseModel):
     #: alias's real HF repo id) — what this process actually downloaded and loaded.
     #: None when `id` already is the real name (embedding/rerank engines).
     source: str | None = None
+    #: Whether this model is currently resident in memory. True for every model
+    #: in single-model mode (the only one this process can report). In registry
+    #: mode this can be False — the registry now always lists every catalog
+    #: entry, even ones never requested, so a client can see what else is
+    #: available without it being loaded yet.
+    loaded: bool = True
 
 
 class ModelsResponse(BaseModel):
