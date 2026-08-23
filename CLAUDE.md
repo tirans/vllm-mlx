@@ -102,9 +102,37 @@
   the measurement traps (SSE chunk counting vs `usage.output_tokens`, prefix-cache cold
   start, stream-interval batching).
 
+## Wedge detection
+
+- `/v1/status` reports `orphan_response_count` and `stalled_for_s` per loaded model, on both
+  the registry and direct paths. `num_running > 0` with `generation_tps == 0` is ambiguous
+  (a long prefill looks identical), so use these to disambiguate: a non-zero orphan count
+  means sequences were decoding with no receiver, and a large `stalled_for_s` means the
+  batch is occupied but not progressing. Both stay 0 on a healthy server.
+- `VLLM_MLX_STALL_WARN_S` (default 600, 0 disables) sets when the scheduler logs
+  `[stall_watchdog]`. Deliberately generous: prefill is O(n^2) and emits nothing while it
+  runs. The watchdog only reports — it never aborts.
+- **Match the client's concurrency to `--max-num-seqs`.** Calls beyond the admission window
+  queue while emitting nothing, which clients routinely misread as a dead endpoint and
+  cancel. See `l3l9`'s `PRISM_LLM_MAX_CONCURRENT`, which must be exported into the serve
+  process's environment — its `llm.env` is not read for that variable.
+
+## Concurrent agents in this checkout
+
+- **One agent per working tree.** On 2026-08-23 a Codex session and a Claude session edited
+  `vllm_mlx/scheduler.py` simultaneously here: a `git stash` taken by one raced the other's
+  writes, `git stash pop` refused with "local changes would be overwritten", and the two
+  nearly landed conflicting versions of the same fix. Nothing was lost, but only because the
+  stash turned out to be a byte-identical duplicate.
+- If a second agent must work here at the same time, give it its own git worktree rather than
+  sharing this one. Before a `git stash`/`checkout`/`reset`, check whether another agent is
+  mid-edit (`ls -la` the file's mtime, `ps aux | grep -iE "codex|pytest"`).
+- Do not run the model-loading integration tests while the port-8000 server is busy. A wedged
+  or loaded 30B server starves them: the same suite took 429–652s with multiple spurious
+  failures under load, and 4.8s with 0 failures on an idle machine.
+
 ## Docs that are wrong in this checkout
 
-- `README.md` advertises `--mtp` and `--spec-prefill`; the real flags are `--enable-mtp` and
-  `--specprefill`. Both README spellings fail argparse.
-- `--moe-top-k` and `docs/guides/moe-top-k.md` describe a feature not present in this checkout
-  (no `apply_moe_top_k_override`, no `tests/test_moe_top_k.py`).
+(Previously listed `--mtp`/`--spec-prefill` and `--moe-top-k`; both corrected — the flags
+now read `--enable-mtp`/`--specprefill` in all four READMEs, and the `moe-top-k` guides were
+removed since `apply_moe_top_k_override` exists in no branch of this repo.)

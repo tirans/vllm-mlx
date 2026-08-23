@@ -65,9 +65,8 @@ claude
 
 ### Reasoning & advanced
 - **Reasoning extraction**: Qwen3, DeepSeek-R1 (`--reasoning-parser`)
-- **MoE expert reduction**: `--moe-top-k` for +7-16% on Qwen3-30B-A3B
-- **Speculative decoding**: `--mtp` for Qwen3-Next
-- **Sparse prefill**: attention-based `--spec-prefill` for TTFT reduction
+- **Speculative decoding**: `--enable-mtp` for Qwen3-Next
+- **Sparse prefill**: attention-based `--specprefill` for TTFT reduction
 
 ### Observability
 - **Prometheus metrics**: `/metrics` endpoint with `--metrics`
@@ -258,7 +257,7 @@ See [Installation Guide](docs/getting-started/installation.md) for full options.
 - **Getting started**: [Installation](docs/getting-started/installation.md) · [Quick Start](docs/getting-started/quickstart.md)
 - **Servers & APIs**: [OpenAI server](docs/guides/server.md) · [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api) · [Python API](docs/guides/python-api.md)
 - **Features**: [Multimodal](docs/guides/multimodal.md) · [Audio](docs/guides/audio.md) · [Embeddings](docs/guides/embeddings.md) · [Reasoning](docs/guides/reasoning.md) · [MCP & Tool Calling](docs/guides/mcp-tools.md) · [Tool Parsers](docs/guides/tool-calling.md)
-- **Performance**: [Continuous Batching](docs/guides/continuous-batching.md) · [Multi-Model Serving](docs/guides/model-registry.md) · [Warm Prompts](docs/guides/warm-prompts.md) · [MoE Top-K](docs/guides/moe-top-k.md)
+- **Performance**: [Continuous Batching](docs/guides/continuous-batching.md) · [Multi-Model Serving](docs/guides/model-registry.md) · [Warm Prompts](docs/guides/warm-prompts.md)
 - **Reference**: [CLI](docs/reference/cli.md) · [Models](docs/reference/models.md) · [Configuration](docs/reference/configuration.md)
 - **Benchmarks**: [LLM](docs/benchmarks/llm.md) · [Image](docs/benchmarks/image.md) · [Video](docs/benchmarks/video.md) · [Audio](docs/benchmarks/audio.md)
 

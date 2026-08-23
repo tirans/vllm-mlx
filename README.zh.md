@@ -65,9 +65,8 @@ claude
 
 ### 推理与高级功能
 - **思维链提取**：Qwen3、DeepSeek-R1（`--reasoning-parser`）
-- **MoE 专家裁剪**：`--moe-top-k`，Qwen3-30B-A3B 上 +7-16%
-- **投机解码**：`--mtp`，用于 Qwen3-Next
-- **稀疏 prefill**：基于注意力的 `--spec-prefill`，降低 TTFT
+- **投机解码**：`--enable-mtp`，用于 Qwen3-Next
+- **稀疏 prefill**：基于注意力的 `--specprefill`，降低 TTFT
 
 ### 可观测性
 - **Prometheus 指标**：使用 `--metrics` 开启 `/metrics` 端点
@@ -233,7 +232,7 @@ pip install -e .
 - **入门**：[安装](docs/getting-started/installation.md) · [快速开始](docs/getting-started/quickstart.md)
 - **服务器与 API**：[OpenAI 服务器](docs/guides/server.md) · [Anthropic Messages API](docs/guides/server.md#anthropic-messages-api) · [Python API](docs/guides/python-api.md)
 - **功能**：[多模态](docs/guides/multimodal.md) · [音频](docs/guides/audio.md) · [嵌入](docs/guides/embeddings.md) · [推理模型](docs/guides/reasoning.md) · [MCP 与工具调用](docs/guides/mcp-tools.md) · [工具解析器](docs/guides/tool-calling.md)
-- **性能**：[连续批处理](docs/guides/continuous-batching.md) · [Warm Prompts](docs/guides/warm-prompts.md) · [MoE Top-K](docs/guides/moe-top-k.md)
+- **性能**：[连续批处理](docs/guides/continuous-batching.md) · [Warm Prompts](docs/guides/warm-prompts.md)
 - **参考**：[CLI](docs/reference/cli.md) · [模型](docs/reference/models.md) · [配置](docs/reference/configuration.md)
 - **基准测试**：[LLM](docs/benchmarks/llm.md) · [图像](docs/benchmarks/image.md) · [视频](docs/benchmarks/video.md) · [音频](docs/benchmarks/audio.md)
 
