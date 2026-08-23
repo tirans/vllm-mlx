@@ -109,6 +109,13 @@
   (a long prefill looks identical), so use these to disambiguate: a non-zero orphan count
   means sequences were decoding with no receiver, and a large `stalled_for_s` means the
   batch is occupied but not progressing. Both stay 0 on a healthy server.
+- **`/v1/status` is itself unavailable during a large prefill**, which is exactly when you
+  most want to read it — the endpoint is single-threaded through the prefill, so the poll
+  just hangs. Give a status poll a generous timeout (180s+, not 30s) and treat a timeout as
+  "busy", never as "down": a monitor at 30s reported two spurious outages on 2026-08-23
+  while the server was at 168% CPU chunk-prefilling 48k tokens and answering at 27.6s. The
+  log is the reliable signal while a prefill runs — `[chunked_prefill] Starting/Completed`
+  lines advancing means real progress. Prefer `[stall_watchdog]` in the log over polling.
 - `VLLM_MLX_STALL_WARN_S` (default 600, 0 disables) sets when the scheduler logs
   `[stall_watchdog]`. Deliberately generous: prefill is O(n^2) and emits nothing while it
   runs. The watchdog only reports — it never aborts.
