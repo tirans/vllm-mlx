@@ -1,11 +1,11 @@
 # CLAUDE.md
 
+@.claude.local.md
+
 ## Commands
 
-- `PYTHONPATH=. .venv/bin/python -m vllm_mlx.cli serve ...` — the venv's `vllm-mlx` console
-  script is INERT: every `.pth` in site-packages carries macOS `UF_HIDDEN`, and CPython 3.13
-  skips hidden `.pth` files, so the editable install never registers.
-  Permanent fix: `chflags nohidden .venv/lib/python3.13/site-packages/*.pth`
+- `PYTHONPATH=. .venv/bin/python -m vllm_mlx.cli serve ...` — canonical CLI invocation
+  (see `.claude.local.md` if the `vllm-mlx` console script is inert on your machine).
 - `./run.sh --help` — the model catalog (`models.json`): name, size, context, port, whether
   the weights are cached. `./run.sh <name>` serves one; `./run.sh --multi a b` serves several
   on one port; `./run.sh --env <name>` prints the client env vars.
@@ -45,6 +45,27 @@
 - `./scripts/serve-qwen3-thinking.sh` is now a shim for `./run.sh reasoning-30b`.
 - `./run.sh --stop --all` kills every listener on a configured port. Check what is running
   first — it does not ask.
+- To smoke-test `run.sh`/registry changes fast, use the `smoke-test-registry` skill
+  (tiny cached models, serve→swap→evict in seconds).
+
+## Reasoning effort
+
+- `reasoning_effort` is a first-class request field on `/v1/chat/completions` (top-level,
+  OpenAI shape) and `/v1/responses` (`reasoning.effort`); both merge into
+  `chat_template_kwargs.reasoning_effort`, which remains the low-level override. Support is
+  **per model template**: the server trial-renders each model's chat template
+  (`vllm_mlx/utils/effort.py`) and validates requests against the exact vocabulary —
+  out-of-vocabulary values and effort on a non-supporting model get a 400 naming the
+  supported set (previously: silent no-op on qwen3-thinking, Jinja 500 on qwen3.8).
+  `/v1/models` lists each entry's vocabulary as `reasoning_efforts` (null = unsupported).
+- Catalog reality: only `qwen3.8-27b` supports it — `low`/`medium`/`xhigh` (NOT `high`),
+  template default is `xhigh`, injected as a system-prompt instruction (so changing effort
+  mid-session invalidates the prefix cache). `reasoning-30b`, `fast-8b`, `tiny-*`,
+  `coder-80b`: no effort dial, only binary `enable_thinking`. Harmony/GPT-OSS models are
+  statically `low`/`medium`/`high`.
+- An effort arriving only via `--default-chat-template-kwargs` is dropped (with a debug log)
+  on non-supporting models instead of failing the request; a request-supplied one is a hard
+  400 by design.
 
 ## Engine gotchas
 
@@ -77,9 +98,9 @@
 
 ## Benchmarking
 
-- Measure tok/s from `usage.output_tokens` in the `message_delta` SSE event, NOT by counting
-  `content_block_delta` chunks — with `--stream-interval N` one chunk holds N tokens, so chunk
-  counting understates interval 1 and overstates higher intervals by that factor.
+- Use the `benchmark-tps` skill before measuring tok/s — it encodes the warmup protocol and
+  the measurement traps (SSE chunk counting vs `usage.output_tokens`, prefix-cache cold
+  start, stream-interval batching).
 
 ## Docs that are wrong in this checkout
 

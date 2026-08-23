@@ -190,6 +190,11 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: dict[str, float] | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
+    # OpenAI-style reasoning effort. Validated against the resolved model's
+    # chat template (each template has its own vocabulary; /v1/models lists it
+    # per model as `reasoning_efforts`). Wins over any `reasoning_effort` key
+    # in chat_template_kwargs.
+    reasoning_effort: str | None = None
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
@@ -350,6 +355,11 @@ class ModelInfo(BaseModel):
     #: entry, even ones never requested, so a client can see what else is
     #: available without it being loaded yet.
     loaded: bool = True
+    #: The `reasoning_effort` values this model's chat template accepts, probed
+    #: by trial-rendering the template (vllm_mlx.utils.effort). None means the
+    #: model does not support the parameter (or its template is not cached
+    #: locally, so support is unknowable without downloading).
+    reasoning_efforts: list[str] | None = None
 
 
 class ModelsResponse(BaseModel):

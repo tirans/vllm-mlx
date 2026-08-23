@@ -772,11 +772,15 @@ class TestResponsesEndpoint:
         assert resp.status_code == 400
         assert "json_object" in resp.json()["detail"]
 
-    def test_reasoning_configuration_is_ignored(self, client):
+    def test_reasoning_effort_on_unsupporting_model_is_rejected(self, client):
+        # Used to be silently ignored; now that reasoning.effort is wired
+        # through, a model whose template does not consume it must answer 400
+        # rather than pretend the level was applied.
         import vllm_mlx.server as srv
 
         engine = _mock_engine(_output("Hello"))
         srv._engine = engine
+        srv._effort_support_cache.clear()
 
         resp = client.post(
             "/v1/responses",
@@ -787,8 +791,35 @@ class TestResponsesEndpoint:
             },
         )
 
+        assert resp.status_code == 400
+        assert "reasoning_effort" in resp.json()["detail"]
+
+    def test_reasoning_effort_reaches_chat_template_kwargs(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("Hello"))
+        engine.tokenizer.chat_template = (
+            "{%- set r = reasoning_effort|default('xhigh') %}"
+            "{%- if r not in ('xhigh', 'medium', 'low') %}"
+            "{{- raise_exception('bad effort') }}{%- endif %}"
+            "{%- for m in messages %}{{ m.content }}{%- endfor %}"
+        )
+        srv._engine = engine
+        srv._effort_support_cache.clear()
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "reasoning": {"effort": "low"},
+            },
+        )
+
         assert resp.status_code == 200
         assert engine.chat.await_count == 1
+        kwargs = engine.chat.await_args.kwargs
+        assert kwargs["chat_template_kwargs"]["reasoning_effort"] == "low"
 
     def test_reasoning_input_item_is_accepted(self, client):
         import vllm_mlx.server as srv

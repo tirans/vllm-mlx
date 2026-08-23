@@ -174,6 +174,7 @@ from .metrics import metrics as _metrics
 from .models.mllm import UnsafeRemoteURLError, _validate_url_safety, is_url
 from .reasoning import get_parser as get_reasoning_parser
 from .tool_parsers import ToolParserManager, get_parser_stop_tokens
+from .utils.effort import supported_efforts, template_from_source, efforts_for_template
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -296,6 +297,99 @@ def _resolve_chat_template_kwargs(
     if request_value:
         resolved.update(request_value)
     return resolved
+
+
+#: Per served-model-name cache of trial-render introspection results. Elastic
+#: mode can swap models within one process, so the key is the request's model
+#: name, not process state; entries are tuples (supported values), None (no
+#: support), or absent (never probed).
+_effort_support_cache: dict[str, tuple[str, ...] | None] = {}
+
+
+def _supported_reasoning_efforts(engine, model_name: str) -> tuple[str, ...] | None:
+    """Which reasoning_effort values the resolved model accepts (cached)."""
+    key = model_name or "__default__"
+    if key not in _effort_support_cache:
+        _effort_support_cache[key] = supported_efforts(
+            tokenizer=_get_engine_tokenizer(engine),
+            use_harmony=bool(getattr(engine, "use_harmony_rendering", False)),
+        )
+    return _effort_support_cache[key]
+
+
+def _reasoning_efforts_for_listing(
+    name: str, source: str | None
+) -> list[str] | None:
+    """Effort vocabulary for a /v1/models entry, from the on-disk template.
+
+    File-based rather than tokenizer-based so unloaded catalog entries are
+    covered too. An uncached model (template not on disk) reports None without
+    poisoning the cache, so it gets probed once the weights are downloaded.
+    """
+    if name in _effort_support_cache:
+        cached = _effort_support_cache[name]
+        return list(cached) if cached else None
+    template = template_from_source(source)
+    if template is None:
+        return None
+    efforts = efforts_for_template(template)
+    _effort_support_cache[name] = efforts
+    return list(efforts) if efforts else None
+
+
+def _apply_reasoning_effort(
+    chat_kwargs: dict, engine, request: "ChatCompletionRequest"
+) -> None:
+    """Merge and validate the request's reasoning effort, or 400 with the model's vocabulary.
+
+    The top-level OpenAI-style ``reasoning_effort`` wins over a
+    ``chat_template_kwargs`` entry. A request-supplied effort on a model whose
+    template does not consume it is a hard 400 — the silent no-op it used to
+    be misleads clients into believing the level was applied. An effort that
+    arrived only via the server-wide ``--default-chat-template-kwargs`` is
+    dropped instead (config convenience must not fail every request). An
+    empty supported tuple means introspection could not determine the
+    vocabulary; the value passes through untouched.
+    """
+    ctk = chat_kwargs.get("chat_template_kwargs")
+    request_effort = request.reasoning_effort or (request.chat_template_kwargs or {}).get(
+        "reasoning_effort"
+    )
+    effort = request_effort or (ctk or {}).get("reasoning_effort")
+    if effort is None:
+        return
+    if request.reasoning_effort is not None:
+        ctk = dict(ctk or {})
+        ctk["reasoning_effort"] = request.reasoning_effort
+        chat_kwargs["chat_template_kwargs"] = ctk
+        effort = request.reasoning_effort
+    supported = _supported_reasoning_efforts(engine, request.model)
+    if supported is None:
+        if request_effort is None:
+            chat_kwargs["chat_template_kwargs"] = {
+                k: v for k, v in (ctk or {}).items() if k != "reasoning_effort"
+            }
+            logger.debug(
+                "Dropping server-default reasoning_effort: model %r does not support it",
+                request.model,
+            )
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"model {request.model!r} does not support reasoning_effort "
+                "(its chat template ignores the parameter); remove it or use a "
+                "model whose /v1/models entry lists reasoning_efforts"
+            ),
+        )
+    if supported and effort not in supported:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"reasoning_effort {effort!r} is not supported by model "
+                f"{request.model!r}; supported values: {', '.join(supported)}"
+            ),
+        )
 
 
 @dataclass
@@ -794,6 +888,7 @@ def _prepare_chat_completion_invocation(
     )
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+    _apply_reasoning_effort(chat_kwargs, engine, request)
 
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
@@ -887,6 +982,7 @@ def _prepare_anthropic_invocation(
     )
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+    _apply_reasoning_effort(chat_kwargs, engine, openai_request)
 
     if openai_request.tools and openai_request.tool_choice != "none":
         template_tools = convert_tools_for_template(openai_request.tools)
@@ -2223,8 +2319,7 @@ def _responses_request_to_chat_request(
             status_code=400,
             detail="Responses text.format.type='json_object' is not supported on this backend",
         )
-    if request.reasoning is not None:
-        logger.debug("Ignoring reasoning configuration (not supported on this backend)")
+    reasoning_effort = request.reasoning.effort if request.reasoning is not None else None
 
     tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
     messages = _responses_input_to_chat_messages(request)
@@ -2264,6 +2359,7 @@ def _responses_request_to_chat_request(
         tools=tools,
         tool_choice=request.tool_choice,
         chat_template_kwargs=request.chat_template_kwargs,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -2418,6 +2514,7 @@ def _prepare_responses_request(
     )
     if resolved_chat_template_kwargs:
         chat_kwargs["chat_template_kwargs"] = resolved_chat_template_kwargs
+    _apply_reasoning_effort(chat_kwargs, engine, chat_request)
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(chat_request.tools)
     if images:
@@ -3819,12 +3916,25 @@ async def list_models() -> ModelsResponse:
     if _model_manager is not None:
         models.extend(
             ModelInfo(
-                id=item["id"], source=item.get("source"), loaded=item.get("loaded", False)
+                id=item["id"],
+                source=item.get("source"),
+                loaded=item.get("loaded", False),
+                reasoning_efforts=_reasoning_efforts_for_listing(
+                    item["id"], item.get("source")
+                ),
             )
             for item in _model_manager.list_models()
         )
     elif _model_name:
-        models.append(ModelInfo(id=_model_name, source=_model_path))
+        models.append(
+            ModelInfo(
+                id=_model_name,
+                source=_model_path,
+                reasoning_efforts=_reasoning_efforts_for_listing(
+                    _model_name, _model_path
+                ),
+            )
+        )
     if _embedding_engine is not None:
         models.append(
             ModelInfo(id=_embedding_engine.model_name, owned_by="vllm-mlx-embedding")

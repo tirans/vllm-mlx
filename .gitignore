@@ -96,3 +96,6 @@ temp/
 
 # MLX cache
 .mlx_cache/
+
+# personal Claude Code notes (loaded via @-import in CLAUDE.md)
+.claude.local.md
