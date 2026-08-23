@@ -3630,6 +3630,11 @@ async def status():
         "steps_executed": stats.get("steps_executed", 0),
         "num_running": stats.get("num_running", 0),
         "num_waiting": stats.get("num_waiting", 0),
+        # Wedge detection: orphan_response_count > 0 means sequences decoded
+        # with nobody to receive them; stalled_for_s high while num_running > 0
+        # means the batch is occupied but not progressing.
+        "orphan_response_count": stats.get("orphan_response_count", 0),
+        "stalled_for_s": stats.get("stalled_for_s", 0),
         "total_requests_processed": stats.get("num_requests_processed", 0),
         "total_prompt_tokens": stats.get("total_prompt_tokens", 0),
         "total_completion_tokens": stats.get("total_completion_tokens", 0),

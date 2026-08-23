@@ -458,6 +458,15 @@ class ModelManager:
                 entry_data["generation_tps"] = engine_stats.get("batch_generator", {}).get(
                     "generation_tps", 0
                 )
+                # Wedge detection. num_running > 0 with generation_tps == 0 is
+                # ambiguous (a long prefill looks the same), so surface the two
+                # signals that disambiguate it: orphaned sequences decoding with
+                # no receiver, and how long the batch has held requests without
+                # emitting a token.
+                entry_data["orphan_response_count"] = engine_stats.get(
+                    "orphan_response_count", 0
+                )
+                entry_data["stalled_for_s"] = engine_stats.get("stalled_for_s", 0)
             data.append(entry_data)
         return data
 

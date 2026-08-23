@@ -655,6 +655,36 @@ class TestSchedulerBasic:
         result = scheduler.abort_request("nonexistent")
         assert result is True
 
+    def test_abort_waiting_request_after_requests_popped(
+        self, mock_model, mock_tokenizer
+    ):
+        """Regression: engine_core's synchronous _cleanup_request can pop
+        self.requests before the deferred abort runs; the waiting-queue
+        entry must still be removed by request_id, not by looking it up
+        in self.requests."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+        )
+
+        request = Request(
+            request_id="test-1",
+            prompt="Hello",
+            sampling_params=SamplingParams(),
+        )
+
+        scheduler.add_request(request)
+        assert scheduler.get_num_waiting() == 1
+
+        scheduler.abort_request("test-1")
+        # Simulate engine_core._cleanup_request() racing ahead and popping
+        # self.requests before the deferred _do_abort_request() runs.
+        scheduler.requests.pop("test-1")
+
+        scheduler._process_pending_aborts()
+
+        assert scheduler.get_num_waiting() == 0
+
     def test_get_stats(self, mock_model, mock_tokenizer):
         """Test getting scheduler stats."""
         scheduler = Scheduler(

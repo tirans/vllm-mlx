@@ -11,7 +11,10 @@ The scheduler follows vLLM's design with:
 - Continuous batching via BatchGenerator
 """
 
+import inspect
 import logging
+import os
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -31,15 +34,53 @@ from .utils.mamba_cache import ensure_mamba_support
 
 logger = logging.getLogger(__name__)
 
+# mlx-lm >=0.31.3 accepts one sampler per inserted sequence, which lets a
+# request with its own temperature/top_p join a batch created for different
+# params.  Probed rather than assumed so an API change degrades instead of
+# raising.
+try:
+    _INSERT_SUPPORTS_SAMPLERS = (
+        "samplers" in inspect.signature(BatchGenerator.insert).parameters
+    )
+except (TypeError, ValueError):  # pragma: no cover - exotic/stubbed mlx-lm
+    _INSERT_SUPPORTS_SAMPLERS = False
+
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
 
-# Error patterns that indicate cache corruption
-CACHE_CORRUPTION_PATTERNS = [
+# Message signatures of KNOWN cache-corruption failure modes.
+#
+# These only LABEL the recovery log line -- recovery is deliberately not
+# gated on them (see step()).  The bare substring "cache" used to sit in
+# this list, which made the label meaningless while simultaneously being
+# the thing that decided whether recovery ran at all.
+KNOWN_CACHE_CORRUPTION_SIGNATURES = [
     "'NoneType' object is not subscriptable",
-    "cache",
     "BatchKVCache",
 ]
+
+# Stall watchdog: how long the batch may hold running requests without any of
+# them producing a token before the scheduler says so.  Deliberately generous
+# -- prefill is O(n^2) here (a 131k-token prompt takes ~5 minutes and emits
+# nothing while it runs), so a tight bound would flag healthy work.  This only
+# reports; it never aborts.  0 disables.
+DEFAULT_STALL_WARN_S = 600.0
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    """Read a float env var, warning and falling back on anything unusable."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+    if value < minimum:
+        logger.warning("%s=%s is below %s; clamping", name, value, minimum)
+        return minimum
+    return value
 
 
 def _normalize_logits_processors(logits_processors):
@@ -1178,6 +1219,24 @@ class Scheduler:
         self.request_id_to_uid: Dict[str, int] = {}
         self.uid_to_request_id: Dict[int, str] = {}
 
+        # UIDs the BatchGenerator is generating for that the scheduler has no
+        # record of.  Tracked to warn once per uid instead of once per decoded
+        # token.  Reset whenever the BatchGenerator is closed -- mlx-lm counts
+        # uids from 0 per instance, so a fresh generator reuses these numbers.
+        self._orphan_uids: Set[int] = set()
+        self.orphan_response_count = 0
+
+        # Stall watchdog state.  _last_output_ts advances only when a real
+        # token reaches a running request, so it stays put while the batch is
+        # occupied but producing nothing -- the signature of the wedge this
+        # was written for.  _stall_warned tracks the warn-once edge so a
+        # persistent stall does not log on every step.
+        self._last_output_ts: float = time.time()
+        self._stall_warn_threshold_s = _env_float(
+            "VLLM_MLX_STALL_WARN_S", DEFAULT_STALL_WARN_S
+        )
+        self._stall_warned = False
+
         # BatchGenerator - the actual batching engine
         self.batch_generator: Optional[BatchGenerator] = None
         self._current_sampler_params: Optional[Tuple] = None
@@ -1406,13 +1465,47 @@ class Scheduler:
 
         # Install MTP if the model supports it
         if self.config.enable_mtp:
-            if hasattr(self.model, "mtp") and self.model.mtp is not None:
-                _install_mtp(
-                    bg,
-                    model=self.model,
-                    num_draft_tokens=self.config.mtp_num_draft_tokens,
-                    optimistic=self.config.mtp_optimistic,
+            # Like the chunked-prefill patch, _install_mtp drives
+            # BatchGenerator internals (_step, _next, active_batch, sampler)
+            # that were refactored out in mlx-lm 0.31.x.  Without this guard
+            # the very first line of _install_mtp raises AttributeError out of
+            # generator creation, so every request to a server started with
+            # --enable-mtp fails.  Degrade to plain decoding instead.
+            mtp_required_attrs = ("_step", "_next", "active_batch", "sampler")
+            missing = [a for a in mtp_required_attrs if not hasattr(bg, a)]
+            if missing:
+                logger.warning(
+                    "[MTP] disabled: mlx-lm BatchGenerator lacks required "
+                    "internals (%s). Upgrade mlx-lm or drop --enable-mtp.",
+                    ", ".join(missing),
                 )
+            elif hasattr(self.model, "mtp") and self.model.mtp is not None:
+                # A half-applied patch is worse than none. Snapshot the
+                # instance attributes _install_mtp rebinds so a failure can
+                # restore them exactly -- note _next may legitimately already
+                # hold the chunked-prefill patch, so blanket-deleting it would
+                # silently undo that.
+                patched_attrs = ("_step", "_next", "_inner_next")
+                pre_install = {
+                    a: bg.__dict__[a] for a in patched_attrs if a in bg.__dict__
+                }
+                try:
+                    _install_mtp(
+                        bg,
+                        model=self.model,
+                        num_draft_tokens=self.config.mtp_num_draft_tokens,
+                        optimistic=self.config.mtp_optimistic,
+                    )
+                except Exception as e:
+                    for attr in patched_attrs:
+                        bg.__dict__.pop(attr, None)
+                    bg.__dict__.update(pre_install)
+                    logger.warning(
+                        "[MTP] install failed (%s: %s); continuing without MTP.",
+                        type(e).__name__,
+                        e,
+                        exc_info=True,
+                    )
             else:
                 logger.warning(
                     "[MTP] --enable-mtp is set but model has no MTP head "
@@ -1546,26 +1639,39 @@ class Scheduler:
             except Exception as e:
                 logger.debug(f"Error closing BatchGenerator: {e}")
             self.batch_generator = None
+        # uids are counted from 0 per BatchGenerator instance, so warn-once
+        # bookkeeping from the old instance must not suppress warnings for
+        # genuinely new orphans in the next one.
+        self._orphan_uids.clear()
 
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:
         """Ensure BatchGenerator exists with compatible settings."""
-        sampler_params = (
-            sampling_params.temperature,
-            sampling_params.top_p,
-            sampling_params.min_p,
-        )
+        sampler_params = self._sampler_params(sampling_params)
 
         # Create new generator if needed or if sampling params changed
         if (
             self.batch_generator is None
             or self._current_sampler_params != sampler_params
         ):
-            # If we have an existing generator with requests, we need to drain it first
+            # An active batch cannot be recreated underneath its requests.
+            # The incoming request still gets its own sampling params:
+            # _schedule_waiting passes an explicit per-sequence sampler when
+            # they differ from the generator's.  (This branch used to warn
+            # that new params would apply "after current batch completes" and
+            # then insert into the existing batch anyway, so the request
+            # silently decoded at the batch's temperature/top_p.)
             if self.batch_generator is not None and self.running:
-                logger.warning(
-                    "Sampling parameters changed with active requests. "
-                    "New requests will use new parameters after current batch completes."
-                )
+                if _INSERT_SUPPORTS_SAMPLERS:
+                    logger.debug(
+                        "[sampler] params differ from the active batch; using a "
+                        "per-request sampler instead of recreating the generator"
+                    )
+                else:
+                    logger.warning(
+                        "Sampling parameters changed with active requests and this "
+                        "mlx-lm does not accept per-sequence samplers. The request "
+                        "will decode with the active batch's sampling params."
+                    )
                 return
 
             # Keep prefix cache across BatchGenerator recreations.
@@ -1590,6 +1696,31 @@ class Scheduler:
             self._close_batch_generator()
             self.batch_generator = self._create_batch_generator(sampling_params)
             self._current_sampler_params = sampler_params
+
+    @staticmethod
+    def _sampler_params(sampling_params: SamplingParams) -> Tuple:
+        """The sampler-defining subset of a request's sampling params."""
+        return (
+            sampling_params.temperature,
+            sampling_params.top_p,
+            sampling_params.min_p,
+        )
+
+    def _make_request_sampler(self, sampling_params: SamplingParams):
+        """Per-sequence sampler for a request, or None to use the batch's.
+
+        Returns None when the request's params already match the generator's
+        own sampler so that mlx-lm keeps its vectorized sampling path — it
+        falls back to a per-sequence Python loop as soon as any sampler entry
+        is non-None (mlx_lm/generate.py: `if any(self.samplers)`).
+        """
+        if not _INSERT_SUPPORTS_SAMPLERS:
+            return None
+        params = self._sampler_params(sampling_params)
+        if params == self._current_sampler_params:
+            return None
+        temperature, top_p, min_p = params
+        return make_sampler(temp=temperature, top_p=top_p, min_p=min_p)
 
     def _validate_cache(self, cache: Any) -> bool:
         """
@@ -1921,13 +2052,20 @@ class Scheduler:
         was_running = False
         removed_from_batch = False
 
-        # Remove from waiting queue
-        if request is not None and request.status == RequestStatus.WAITING:
-            was_waiting = True
-            try:
-                self.waiting.remove(request)
-            except ValueError:
-                pass
+        # Remove from waiting queue. Scan self.waiting by request_id instead
+        # of gating on self.requests.get() -- self.requests is popped
+        # synchronously by engine_core's _cleanup_request() before this
+        # deferred abort runs, so `request` above is routinely already None
+        # for a request that is still sitting in self.waiting. Relying on it
+        # here left the entry stranded forever, to be scheduled later as an
+        # orphan with nowhere to deliver its output.
+        for i, queued in enumerate(self.waiting):
+            if queued.request_id == request_id:
+                was_waiting = True
+                del self.waiting[i]
+                if request is None:
+                    request = queued
+                break
 
         # Remove from running (BatchGenerator) — do this even if request
         # was already cleaned up from self.requests, because the UID may
@@ -2076,6 +2214,21 @@ class Scheduler:
                 # mlx_lm BatchGenerator never stores None per-sequence.
                 "logits_processors": [lp] if lp else [[]],
             }
+            # Honour this request's temperature/top_p/min_p even when the
+            # generator was built for a different set (i.e. an active batch
+            # blocked recreation in _ensure_batch_generator). None keeps
+            # mlx-lm's vectorized sampling path for the common case where
+            # every sequence shares the generator's params.
+            request_sampler = self._make_request_sampler(request.sampling_params)
+            if request_sampler is not None:
+                insert_kwargs["samplers"] = [request_sampler]
+                logger.info(
+                    f"[sampler] request={request.request_id[:12]} "
+                    f"per-request sampler temp="
+                    f"{request.sampling_params.temperature} "
+                    f"top_p={request.sampling_params.top_p} "
+                    f"min_p={request.sampling_params.min_p}"
+                )
             try:
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
@@ -2137,6 +2290,70 @@ class Scheduler:
 
         return scheduled
 
+    def stalled_for_s(self) -> float:
+        """Seconds since a running request last produced a token (0 if idle).
+
+        Idle is not stalled: with nothing running there is nothing to produce,
+        so an idle server must not look wedged.
+        """
+        if not self.running:
+            return 0.0
+        return max(0.0, time.time() - self._last_output_ts)
+
+    def _check_stall(self) -> None:
+        """Report a batch that holds requests without decoding anything.
+
+        Reporting only -- recovery is deliberately not automatic here. The
+        known cause (orphaned sequences) now self-heals in
+        _handle_orphan_response; this is the backstop that makes an *unknown*
+        stall visible instead of silent, which is what turned the original
+        incident into a 13.5-hour outage.
+        """
+        if self._stall_warn_threshold_s <= 0 or self._stall_warned:
+            return
+        stalled = self.stalled_for_s()
+        if stalled < self._stall_warn_threshold_s:
+            return
+        self._stall_warned = True
+        logger.warning(
+            "[stall_watchdog] no output for %.0fs while holding %d running / "
+            "%d waiting request(s). orphans=%d. The batch looks busy but is "
+            "not decoding; check /v1/status and the batch generator.",
+            stalled,
+            len(self.running),
+            len(self.waiting),
+            self.orphan_response_count,
+        )
+
+    def _drop_uid_mapping(self, request_id: str, uid: int) -> None:
+        """Drop a request_id<->uid mapping pair, tolerating partial state."""
+        self.uid_to_request_id.pop(uid, None)
+        if self.request_id_to_uid.get(request_id) == uid:
+            del self.request_id_to_uid[request_id]
+
+    def _handle_orphan_response(self, uid: int) -> None:
+        """Evict a BatchGenerator sequence the scheduler has no record of.
+
+        Warns once per uid: an orphan emits a token on every step, so an
+        unguarded log line floods at decode rate.
+        """
+        self.orphan_response_count += 1
+        if uid not in self._orphan_uids:
+            self._orphan_uids.add(uid)
+            logger.warning(
+                f"[orphan_response] uid={uid} has no request mapping; "
+                f"evicting it from the batch. running={len(self.running)} "
+                f"waiting={len(self.waiting)} total_orphans="
+                f"{self.orphan_response_count}"
+            )
+        if self.batch_generator is not None:
+            try:
+                # Unknown uids are a no-op in mlx-lm (_find_uids only returns
+                # matches), so this is safe even if the sequence is already gone.
+                self.batch_generator.remove([uid])
+            except Exception as e:
+                logger.debug(f"[orphan_response] uid={uid} eviction failed: {e}")
+
     def _process_batch_responses(
         self, responses: List[Any]
     ) -> Tuple[List[RequestOutput], Set[str]]:
@@ -2155,14 +2372,37 @@ class Scheduler:
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
             if request_id is None:
+                # The BatchGenerator is decoding a sequence the scheduler has
+                # no record of.  Nothing will ever finish it, so it holds a
+                # batch slot and burns decode throughput for the lifetime of
+                # the generator.  Evict it and account for it.
+                self._handle_orphan_response(response.uid)
                 continue
 
             request = self.running.get(request_id)
             if request is None:
+                # Mapping outlived the request (aborted between steps).
+                # Harmless on its own, but the stale mapping would take this
+                # branch on every subsequent token, so drop it.
+                logger.debug(
+                    f"[stale_uid] request={request_id[:12]} uid={response.uid} "
+                    f"response for a request that is no longer running"
+                )
+                self._drop_uid_mapping(request_id, response.uid)
                 continue
 
             # Append token to request
             request.append_output_token(response.token)
+
+            # Real forward progress: clears any standing stall warning.
+            self._last_output_ts = time.time()
+            if self._stall_warned:
+                self._stall_warned = False
+                logger.warning(
+                    "[stall_watchdog] RECOVERED: token produced after "
+                    "%.0fs of no output",
+                    self._stall_warn_threshold_s,
+                )
 
             # Record first token time for TTFT metric
             if request.first_token_time is None and request.num_output_tokens > 0:
@@ -2403,9 +2643,12 @@ class Scheduler:
             mx.clear_cache()
 
     def _is_cache_corruption_error(self, error: Exception) -> bool:
-        """Check if an error indicates cache corruption."""
+        """Whether *error* matches a known cache-corruption signature.
+
+        Used to label recovery logs, not to decide whether to recover.
+        """
         error_str = str(error)
-        return any(pattern in error_str for pattern in CACHE_CORRUPTION_PATTERNS)
+        return any(sig in error_str for sig in KNOWN_CACHE_CORRUPTION_SIGNATURES)
 
     def _is_stream_thread_error(self, error: Exception) -> bool:
         """Check if an error indicates MLX stream/thread ownership mismatch."""
@@ -2537,29 +2780,71 @@ class Scheduler:
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
 
+                # Report (never abort) a batch that holds requests but is not
+                # decoding.  Checked after processing so a step that produced
+                # tokens has already refreshed the progress timestamp.
+                self._check_stall()
+
                 # Success - break out of retry loop
                 break
 
             except TypeError as e:
-                # Catch the NoneType error specifically
-                if self._is_cache_corruption_error(e):
-                    if attempt < max_retries:
-                        logger.warning(
-                            f"Cache corruption detected (attempt {attempt + 1}), "
-                            f"performing recovery and retry..."
-                        )
-                        # Deep reset to recover
-                        self._recover_from_cache_error()
-                        # Re-add any running requests back to waiting
-                        self._reschedule_running_requests()
-                    else:
-                        logger.error(
-                            f"Cache corruption not recoverable after "
-                            f"{max_retries + 1} attempts"
-                        )
-                        raise
+                # A TypeError escaping the generation step is always an engine
+                # state error, so recovery is NOT gated on the message.  A
+                # signature that failed to match used to re-raise, and a raise
+                # out of step() is a hang rather than a crash: engine_core
+                # (engine_core.py:322) logs it, sleeps 100ms and re-enters the
+                # loop with the same broken state, forever.  The signature list
+                # only labels the log line -- an `unknown` label is the signal
+                # that a new failure mode exists.
+                signature = "known" if self._is_cache_corruption_error(e) else "unknown"
+                if attempt < max_retries:
+                    logger.warning(
+                        f"[cache_recovery] signature={signature} "
+                        f"attempt={attempt + 1}/{max_retries + 1} "
+                        f"recovering from {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    # Deep reset to recover
+                    self._recover_from_cache_error()
+                    # Re-add any running requests back to waiting
+                    self._reschedule_running_requests()
                 else:
-                    raise
+                    # Out of retries.  Fail the in-flight requests rather than
+                    # re-raising (see above): a client gets an error it can
+                    # retry instead of a connection that never answers.
+                    logger.error(
+                        f"[cache_recovery] signature={signature} not recoverable "
+                        f"after {max_retries + 1} attempts, failing in-flight "
+                        f"requests: {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    aborted_ids = self._recover_from_generation_error()
+                    # If the failure happened inside _schedule_waiting(), the
+                    # requests never reached self.running and _recover_from_
+                    # generation_error() found nothing to abort -- they would
+                    # sit in self.waiting and reproduce this failure on every
+                    # subsequent step.  Drain them too.
+                    if not aborted_ids and self.waiting:
+                        logger.error(
+                            f"[cache_recovery] draining {len(self.waiting)} "
+                            f"waiting requests that cannot be scheduled"
+                        )
+                        while self.waiting:
+                            queued = self.waiting.popleft()
+                            queued.set_finished(RequestStatus.FINISHED_ABORTED)
+                            aborted_ids.add(queued.request_id)
+                            self.finished_req_ids.add(queued.request_id)
+                    for rid in aborted_ids:
+                        output.outputs.append(
+                            RequestOutput(
+                                request_id=rid,
+                                finished=True,
+                                finish_reason="error",
+                            )
+                        )
+                    output.finished_request_ids = aborted_ids
+                    break
             except Exception as e:
                 if self._is_stream_thread_error(e):
                     raise
@@ -2710,6 +2995,13 @@ class Scheduler:
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            # Wedge detection. A non-zero orphan count means sequences were
+            # decoding with nobody to receive them; a large stalled_for_s with
+            # num_running > 0 means the batch is occupied but not progressing.
+            # Both used to be invisible, which is what made the original
+            # outage last 13.5 hours.
+            "orphan_response_count": self.orphan_response_count,
+            "stalled_for_s": round(self.stalled_for_s(), 1),
         }
         # Include Metal memory stats
         try:
