@@ -123,6 +123,13 @@
   queue while emitting nothing, which clients routinely misread as a dead endpoint and
   cancel. See `l3l9`'s `PRISM_LLM_MAX_CONCURRENT`, which must be exported into the serve
   process's environment — its `llm.env` is not read for that variable.
+- **A probe-gated client can stay blocked for hours after the endpoint is healthy.** Prism's
+  supervisor only resumes once an 8-token probe decodes inside 45s, so anything saturating
+  the GPU keeps it out. Measured 2026-08-24: 80 probe-shaped requests over a ~4h window
+  produced 4 successful completions, and a map that failed at 04:37 did not resume until
+  08:45 even though the endpoint was up and `/v1/status` reported `waiting=0` throughout.
+  When diagnosing "why hasn't it picked back up", count successful small completions
+  (`Chat completion (stream): 8 tokens`) rather than trusting `num_running`/`num_waiting`.
 
 ## Concurrent agents in this checkout
 
