@@ -41,6 +41,14 @@ from .request import RequestOutput, RequestStatus, SamplingParams
 
 logger = logging.getLogger(__name__)
 
+#: Consecutive failed passes of the MLLM process loop before it stops retrying and
+#: fails whatever is in flight. Retrying helps only a TRANSIENT fault; when the cause
+#: is the state the loop re-enters with, an unbounded retry is a server that is up,
+#: answers nothing, and logs the identical traceback until someone notices -- 1514 of
+#: them on 2026-08-24, 100ms apart. Generous enough that a genuinely intermittent
+#: fault still rides through.
+MAX_CONSECUTIVE_STEP_ERRORS = 20
+
 
 @dataclass
 class MLLMSchedulerConfig:
@@ -452,6 +460,28 @@ class MLLMScheduler:
 
         return request_id
 
+    def _abort_all_in_flight(self, reason: str) -> None:
+        """Fail every running/waiting request so a stuck loop cannot hold them.
+
+        The escape hatch for a process loop that is failing on the state it keeps
+        re-entering with. Aborting is not a fix -- it is what turns "the endpoint
+        accepted my request and will never answer" into an error the client can act
+        on, which is the difference the 2026-08-24 outage turned on.
+        """
+        stuck = list(self.running) + [r.request_id for r in list(self.waiting)]
+        for request_id in stuck:
+            try:
+                self.abort_request(request_id)
+            except Exception:
+                logger.debug(
+                    "[mllm_loop] abort of %s failed during recovery",
+                    request_id[:12],
+                    exc_info=True,
+                )
+        logger.error(
+            "[mllm_loop] aborted %d request(s): %s", len(stuck), reason
+        )
+
     def abort_request(self, request_id: str) -> bool:
         """
         Abort a request.
@@ -667,8 +697,43 @@ class MLLMScheduler:
                     detok = NaiveStreamingDetokenizer(tokenizer)
                     self._detokenizer_pool[request_id] = detok
                 detok = self._detokenizer_pool[request_id]
-                detok.add_token(response.token)
-                new_text = detok.last_segment
+                try:
+                    detok.add_token(response.token)
+                    new_text = detok.last_segment
+                except Exception as exc:
+                    # A token id outside the tokenizer's range raises out of
+                    # `decode` (observed 2026-08-24: `OverflowError: out of range
+                    # integral type conversion attempted` on qwen3.8-27b). It used
+                    # to escape into `_process_loop`, whose handler logs, sleeps
+                    # 100ms and re-enters with the SAME undecodable token still at
+                    # the head of the batch -- 1514 identical tracebacks before the
+                    # process went away, with the endpoint refusing connections
+                    # throughout. One corrupt token is a property of one request,
+                    # so fail that request and let the batch continue.
+                    logger.error(
+                        "[detokenize] request=%s token=%r is not decodable (%s: %s); "
+                        "failing this request instead of the process loop",
+                        request_id[:12],
+                        getattr(response, "token", None),
+                        type(exc).__name__,
+                        exc,
+                    )
+                    self._detokenizer_pool.pop(request_id, None)
+                    request.status = RequestStatus.FINISHED_ABORTED
+                    request.finish_reason = "error"
+                    outputs.append(
+                        RequestOutput(
+                            request_id=request_id,
+                            new_text="",
+                            output_token_ids=request.output_tokens,
+                            prompt_tokens=request.num_prompt_tokens,
+                            completion_tokens=request.num_output_tokens,
+                            finished=True,
+                            finish_reason="error",
+                        )
+                    )
+                    finished_ids.add(request_id)
+                    continue
 
             # Create output
             output = RequestOutput(
@@ -872,6 +937,9 @@ class MLLMScheduler:
 
         loop = asyncio.get_running_loop()
 
+        # Reset on any successful pass; see the handler at the bottom of the loop.
+        consecutive_step_errors = 0
+
         while self._running:
             try:
                 # --- Early preprocessing phase ---
@@ -943,8 +1011,32 @@ class MLLMScheduler:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Error in MLLM process loop: {e}", exc_info=True)
+                # Retrying is only useful for a TRANSIENT fault. When the cause is
+                # the state the loop re-enters with -- an undecodable token at the
+                # head of the batch, a corrupt cache -- this handler re-runs the
+                # identical step forever: 1514 identical tracebacks on 2026-08-24,
+                # 100ms apart, while the endpoint served nothing. Count consecutive
+                # failures and abort the in-flight requests once retrying has
+                # clearly stopped helping, so clients get an error they can retry
+                # instead of a server that is up but permanently unproductive.
+                consecutive_step_errors += 1
+                logger.error(
+                    f"Error in MLLM process loop "
+                    f"(consecutive={consecutive_step_errors}): {e}",
+                    exc_info=True,
+                )
+                if consecutive_step_errors >= MAX_CONSECUTIVE_STEP_ERRORS:
+                    logger.error(
+                        "[mllm_loop] %d consecutive step failures; aborting %d "
+                        "in-flight request(s) to break the retry loop",
+                        consecutive_step_errors,
+                        len(self.running),
+                        )
+                    self._abort_all_in_flight("mllm process loop is not recovering")
+                    consecutive_step_errors = 0
                 await asyncio.sleep(0.1)
+            else:
+                consecutive_step_errors = 0
 
     async def add_request_async(
         self,
