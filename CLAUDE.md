@@ -123,11 +123,20 @@
   queue while emitting nothing, which clients routinely misread as a dead endpoint and
   cancel. See `l3l9`'s `PRISM_LLM_MAX_CONCURRENT`, which must be exported into the serve
   process's environment — its `llm.env` is not read for that variable.
-- **A probe-gated client can stay blocked for hours after the endpoint is healthy.** Prism's
-  supervisor only resumes once an 8-token probe decodes inside 45s, so anything saturating
-  the GPU keeps it out. Measured 2026-08-24: 80 probe-shaped requests over a ~4h window
-  produced 4 successful completions, and a map that failed at 04:37 did not resume until
-  08:45 even though the endpoint was up and `/v1/status` reported `waiting=0` throughout.
+- **`--multi` with two large models and `--gpu-memory-utilization 0.90` will wire the whole
+  machine.** On a 128GB Mac that limit resolves to `allocation_limit=103.9GB`, and with
+  `reasoning-30b` + `qwen3.8-27b` both resident MLX took it: measured 2026-08-24,
+  `wired=111.3GB`, `free=0.6GB`, swap `61.3/62.5GB`, 30.8M pageins. Stopping the endpoint
+  alone restored `free=113.0GB, wired=4.8GB`. `/v1/status` showed nothing wrong —
+  `running=0 waiting=0 orphans=0 stalled_for_s=0` throughout — because the wedge gauges
+  answer "is the batch stuck", not "is this machine thrashing".
+- **Check the machine before believing any endpoint diagnosis.** `vm_stat` (wired vs free)
+  and `sysctl vm.swapusage` first; the scheduler's own `[Metal memory] active=` line read
+  246-254GB on a 128GB box, so treat it as MLX's virtual accounting, not residency.
+- **A probe-gated client stays blocked for as long as the machine is thrashing.** Prism's
+  supervisor resumes only once an 8-token probe decodes inside 45s. Under the swap
+  condition above, 246 probe requests produced 4 successes and a failed map waited 6h45m to
+  resume; on a healthy machine the same probe returns in 0.9s and the map resumed in 39s.
   When diagnosing "why hasn't it picked back up", count successful small completions
   (`Chat completion (stream): 8 tokens`) rather than trusting `num_running`/`num_waiting`.
 
