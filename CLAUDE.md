@@ -130,6 +130,18 @@
   alone restored `free=113.0GB, wired=4.8GB`. `/v1/status` showed nothing wrong —
   `running=0 waiting=0 orphans=0 stalled_for_s=0` throughout — because the wedge gauges
   answer "is the batch stuck", not "is this machine thrashing".
+- **Elastic single mode swaps models, and a swap can wedge the GPU.** Observed 2026-08-25:
+  a map moved from a rung using `reasoning-30b` to one using `qwen3.8-27b` under
+  `max resident 1`, and the swap raised `RuntimeError: There is no Stream(gpu, 8) in
+  current thread` out of `mx.eval` in the batch generator's prompt path. Every Metal
+  submission after that failed with `Command buffer execution failed: Ignored (for causing
+  prior/excessive GPU errors)` — 1742 of them. `scheduler.py`'s step loop deliberately
+  re-raises a stream/thread error (`_is_stream_thread_error`), and a raise out of `step()`
+  is a hang rather than a crash, so the endpoint stayed listening, answered `/v1/models`
+  with 200, and returned 503 to every generation until it was restarted. If a workload
+  alternates models per stage, prefer `--multi` so no swap ever happens — with
+  `MLX_BUFFER_CACHE_LIMIT` set, two resident models cost ~77GB wired rather than the 111GB
+  that made `--multi` look like the problem in the first place.
 - **Check the machine before believing any endpoint diagnosis.** `vm_stat` (wired vs free)
   and `sysctl vm.swapusage` first; the scheduler's own `[Metal memory] active=` line read
   246-254GB on a 128GB box, so treat it as MLX's virtual accounting, not residency.
