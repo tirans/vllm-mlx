@@ -104,6 +104,24 @@
 
 ## Wedge detection
 
+**The pattern behind every incident below: this server fails by reporting itself healthy.**
+Four distinct bugs found on 2026-08-24/25 were all the same shape — ghost requests holding
+slots (638bd07), a step loop re-entering forever on state it cannot recover from (8dea781,
+ee8af4f), a wedged engine streaming 200 + empty SSE (08991f2), and an engine-aborted request
+rendered as a 0-token success (3e39673). In all four the endpoint kept listening, answered
+`/v1/models` with 200, and reported `running=0 waiting=0 orphans=0 stalled_for_s=0`. Assume a
+green dashboard is evidence of nothing until a real completion proves otherwise.
+
+Two heuristics that actually found bugs here, both cheap:
+
+- **A number too good to be physically possible is a bug, not a win.** 582 model calls in 32
+  minutes against a measured 29 min/call was read as "this rung is fast" and reported as a
+  success; 581 of those calls were empty. A 0.01s completion was what exposed the fourth bug.
+  When throughput improves by an order of magnitude, verify the *content* before believing it.
+- **Check the machine before believing any diagnosis of the server** — `vm_stat` (wired vs
+  free) and `sysctl vm.swapusage`. A thrashing box makes every endpoint symptom look like an
+  endpoint bug.
+
 - `/v1/status` reports `orphan_response_count` and `stalled_for_s` per loaded model, on both
   the registry and direct paths. `num_running > 0` with `generation_tps == 0` is ambiguous
   (a long prefill looks identical), so use these to disambiguate: a non-zero orphan count
