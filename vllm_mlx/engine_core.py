@@ -451,10 +451,19 @@ class EngineCore:
                         )
 
                     if output.finished:
+                        # `finished_normally` gates the abort in the `finally`:
+                        # an engine-aborted request IS finished, so it must not
+                        # be aborted a second time. But it did not finish
+                        # normally, and logging it that way is how a
+                        # stream/thread abort came to read as a clean 0-token
+                        # completion on 2026-08-25.
                         finished_normally = True
+                        engine_error = output.finish_reason == "error"
                         logger.info(
-                            f"[stream_outputs] {request_id[:12]} finished normally, "
-                            f"{_token_count} tokens in {_time.monotonic() - _t0:.1f}s"
+                            f"[stream_outputs] {request_id[:12]} "
+                            f"{'ABORTED BY ENGINE' if engine_error else 'finished normally'}"
+                            f", {_token_count} tokens in "
+                            f"{_time.monotonic() - _t0:.1f}s"
                         )
                         yield output
                         break

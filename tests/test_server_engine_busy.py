@@ -327,6 +327,55 @@ class TestEnsureSSETerminal:
         assert len(msg) <= server._STREAM_ERROR_MESSAGE_LIMIT
         assert msg.endswith("...")
 
+    def test_engine_abort_terminal_becomes_an_error_frame(self):
+        """The third shape: an aborted request must not read as a 0-token success.
+
+        `_recover_from_generation_error` fails an in-flight request with
+        `finish_reason="error"`. Nothing downstream treated that as special, so
+        on 2026-08-25 a stream/thread abort reached the client as
+        "Chat completion (stream): 0 tokens in 0.01s" -- a well-formed,
+        successful-looking, empty stream. No exception is raised anywhere, so
+        the _ensure_sse_terminal path (08991f2) cannot catch it.
+        """
+        import json
+        from types import SimpleNamespace
+
+        import vllm_mlx.server as server
+
+        aborted = SimpleNamespace(finished=True, finish_reason="error")
+        frame = server._engine_error_frame_if_failed(
+            aborted, server._openai_error_frame
+        )
+        assert frame is not None
+        payload = json.loads(frame.split("data: ", 1)[1])
+        assert payload["error"]["code"] == "engine_error"
+        assert "retried" in payload["error"]["message"]
+
+    def test_normal_terminals_are_untouched(self):
+        """stop/length/tool_calls must not be turned into errors."""
+        from types import SimpleNamespace
+
+        import vllm_mlx.server as server
+
+        for reason in ("stop", "length", "tool_calls", "content_filter", None):
+            out = SimpleNamespace(finished=True, finish_reason=reason)
+            assert (
+                server._engine_error_frame_if_failed(out, server._openai_error_frame)
+                is None
+            ), reason
+
+    def test_unfinished_output_is_untouched(self):
+        """A mid-stream chunk that happens to carry the reason is not terminal."""
+        from types import SimpleNamespace
+
+        import vllm_mlx.server as server
+
+        out = SimpleNamespace(finished=False, finish_reason="error")
+        assert (
+            server._engine_error_frame_if_failed(out, server._openai_error_frame)
+            is None
+        )
+
     def test_aclose_does_not_raise(self):
         """Yielding from the finally block used to break on client disconnect."""
         import asyncio

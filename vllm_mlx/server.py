@@ -1147,6 +1147,49 @@ def _engine_busy_headers(exc: EngineBusy) -> dict[str, str]:
     return {"Retry-After": str(exc.retry_after)}
 
 
+class EngineGenerationFailed(RuntimeError):
+    """The engine terminated a request with ``finish_reason='error'``.
+
+    Not raised by the engine -- synthesised at the SSE boundary so an aborted
+    request produces a typed error frame instead of a normal-looking terminal.
+    """
+
+    code = "engine_error"
+
+
+def _engine_error_frame_if_failed(output, frame_builder) -> str | None:
+    """An error frame when *output* is the engine's failure terminal, else None.
+
+    `scheduler._recover_from_generation_error` (and the stream/thread recovery
+    added in ee8af4f) fail an in-flight request by emitting
+    `RequestOutput(finished=True, finish_reason="error")`. Nothing downstream
+    treated that reason as special: `engine_core` logs "finished normally" for
+    any finished output, and the SSE layer only ever special-cased "length", so
+    the client received a well-formed, zero-token, successful-looking stream.
+
+    Observed 2026-08-25 on a fresh process: a stream/thread mismatch fired the
+    recovery, and the aborted request was reported to the client as
+    "Chat completion (stream): 0 tokens in 0.01s". A retry of the same prompt at
+    the same temperature then produced 2255 tokens. Silent, so it never appeared
+    in any error log -- a downstream consumer that trusted the finish frame
+    would cache an empty artifact.
+
+    `"error"` is also not an OpenAI finish_reason (stop/length/tool_calls/
+    content_filter), so a client switching on the known set falls through to
+    "stopped normally". An explicit error frame removes the ambiguity.
+    """
+    if not getattr(output, "finished", False):
+        return None
+    if getattr(output, "finish_reason", None) != "error":
+        return None
+    return frame_builder(
+        EngineGenerationFailed(
+            "the engine aborted this request while generating; it was reset and "
+            "the request must be retried"
+        )
+    )
+
+
 #: Longest failure text carried in an in-band SSE error frame. The message is a
 #: diagnostic for the client, not a log: an MLX/Metal fault can carry a long
 #: driver string and there is no reason to stream all of it. The full text is
@@ -6296,6 +6339,18 @@ async def stream_completion(
 
     try:
         async for output in engine.stream_generate(**generate_kwargs):
+            # An engine-aborted request must not be rendered as a normal
+            # terminal; see _engine_error_frame_if_failed. `return` runs the
+            # `finally` below, so the ordering stays error-frame then [DONE].
+            failure = _engine_error_frame_if_failed(output, _openai_error_frame)
+            if failure is not None:
+                result = "error"
+                logger.warning(
+                    "Completion stream aborted by the engine; emitting an error "
+                    "frame instead of a 0-token success"
+                )
+                yield failure
+                return
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             prompt_tokens = (
@@ -6424,6 +6479,18 @@ async def stream_chat_completion(
     try:
         # Stream content
         async for output in engine.stream_chat(messages=messages, **kwargs):
+            # See _engine_error_frame_if_failed. This is the path l3l9 and any
+            # other chat client uses, and the one that reported a stream/thread
+            # abort as "0 tokens in 0.01s" on 2026-08-25.
+            failure = _engine_error_frame_if_failed(output, _openai_error_frame)
+            if failure is not None:
+                result = "error"
+                logger.warning(
+                    "Chat stream aborted by the engine; emitting an error frame "
+                    "instead of a 0-token success"
+                )
+                yield failure
+                return
             if metrics_tracker is not None:
                 metrics_tracker.observe_ttft()
             delta_text = output.new_text
