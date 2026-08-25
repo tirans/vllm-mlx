@@ -45,6 +45,10 @@
 - `./scripts/serve-qwen3-thinking.sh` is now a shim for `./run.sh reasoning-30b`.
 - `./run.sh --stop --all` kills every listener on a configured port. Check what is running
   first — it does not ask.
+- `./run.sh --multi a b -- --extra-flag` — everything after `--` passes through to the
+  underlying `serve` (e.g. `-- --disable-prefix-cache`).
+- The server log is `/tmp/vllm-mlx.log`. Relaunch with `>>`, never `>`: truncating it on
+  restart destroys the forensic window you will want ten minutes later.
 - To smoke-test `run.sh`/registry changes fast, use the `smoke-test-registry` skill
   (tiny cached models, serve→swap→evict in seconds).
 
@@ -121,6 +125,10 @@ Two heuristics that actually found bugs here, both cheap:
 - **Check the machine before believing any diagnosis of the server** — `vm_stat` (wired vs
   free) and `sysctl vm.swapusage`. A thrashing box makes every endpoint symptom look like an
   endpoint bug.
+- **Calibrate a monitor threshold against measured healthy AND failing values**, never
+  plausibility. Three set by intuition here all cried wolf: a 30s status timeout against a
+  documented ~5min prefill, `Pages free` on an OS that keeps it near zero by design, and a
+  wired-GB bound calibrated for one resident model then left in place for two.
 
 - `/v1/status` reports `orphan_response_count` and `stalled_for_s` per loaded model, on both
   the registry and direct paths. `num_running > 0` with `generation_tps == 0` is ambiguous
@@ -183,6 +191,16 @@ Two heuristics that actually found bugs here, both cheap:
 - Do not run the model-loading integration tests while the port-8000 server is busy. A wedged
   or loaded 30B server starves them: the same suite took 429–652s with multiple spurious
   failures under load, and 4.8s with 0 failures on an idle machine.
+- **Detach anything long-running**: `nohup ./run.sh ... >> log 2>&1 & disown`, from a shell
+  that exits. A harness killing a tracked background task kills its whole process group — on
+  2026-08-24 that took down the endpoint, Prism's API and the UI mid-map despite `nohup`.
+- `pkill -f` is not enough: `prism.api.serve` ignored SIGTERM, and relaunching before it died
+  left two trees racing for one port (two supervisors, two endpoint locks). After any kill,
+  confirm `pgrep -f <pat>` shows exactly one tree; SIGKILL survivors.
+- Verify a config change actually reached the process rather than assuming:
+  `ps -wwwE -p $(pgrep -f prism.api.serve | tail -1) | tr ' ' '\n' | grep ^PRISM_`
+- **Port 8000 is shared with other agent sessions.** Ask before restarting it and say when
+  you're done — a restart costs whoever is mid-map their in-flight calls.
 
 ## Docs that are wrong in this checkout
 
