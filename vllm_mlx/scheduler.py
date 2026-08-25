@@ -2846,13 +2846,48 @@ class Scheduler:
                     output.finished_request_ids = aborted_ids
                     break
             except Exception as e:
-                if self._is_stream_thread_error(e):
-                    raise
                 import traceback
 
+                stream_thread = self._is_stream_thread_error(e)
                 logger.error(
-                    f"Error in batch generation step: {e}\n{traceback.format_exc()}"
+                    f"Error in batch generation step "
+                    f"(stream_thread={stream_thread}): {e}\n{traceback.format_exc()}"
                 )
+                if stream_thread:
+                    # This used to `raise`, and that carve-out was the bug: the
+                    # comment below already knew a raise out of step() is an
+                    # infinite loop in engine_core, not a crash. Measured
+                    # 2026-08-25 -- a stream/thread mismatch at a model swap
+                    # propagated out, engine_core logged/slept/re-entered on the
+                    # same dead stream, and the endpoint served 1742 Metal
+                    # command-buffer failures over hours while still listening
+                    # and answering /v1/models with 200.
+                    #
+                    # engine_core has its own graceful handler for this, but it
+                    # is one-shot AND only reachable while it is still stepping
+                    # on the worker thread (`use_worker_thread`, which that same
+                    # handler permanently disables). Once spent, every later
+                    # mismatch lands here.
+                    #
+                    # Rebind this thread's generation streams before resetting:
+                    # the batch generator's cached state references the stream
+                    # that just went away, so recovery has to re-establish
+                    # ownership first or the reset itself can fault.
+                    try:
+                        from .mlx_streams import bind_generation_streams
+
+                        bind_generation_streams()
+                        logger.warning(
+                            "[stream_thread] rebound generation streams and reset "
+                            "the batch generator; failing in-flight requests so "
+                            "clients get a typed error instead of a stalled stream"
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[stream_thread] stream rebind failed; resetting the "
+                            "batch generator anyway",
+                            exc_info=True,
+                        )
                 # Recover from fatal errors (OOM, Metal crash) instead of
                 # re-raising, which would cause infinite loop in engine_core.
                 aborted_ids = self._recover_from_generation_error()

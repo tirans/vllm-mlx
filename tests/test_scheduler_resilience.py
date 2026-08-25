@@ -214,6 +214,61 @@ class TestStallWatchdog:
         assert "stalled_for_s" in stats
 
 
+class TestStreamThreadRecovery:
+    """A stream/thread mismatch must not escape step() as a raise.
+
+    engine_core answers a raise by logging, sleeping 100ms and re-entering on
+    the same dead stream. Measured 2026-08-25: a mismatch at a model swap
+    produced 1742 Metal command-buffer failures over hours while the endpoint
+    kept listening and answered /v1/models with 200.
+    """
+
+    def _wired(self, scheduler, exc):
+        """Drive step() with a batch generator whose next() raises *exc*."""
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next.side_effect = exc
+        request = _make_request()
+        scheduler.running["req-1"] = request
+        scheduler.requests["req-1"] = request
+        return scheduler
+
+    def test_stream_thread_error_does_not_escape(self):
+        scheduler = _make_scheduler()
+        self._wired(scheduler, RuntimeError("There is no Stream(gpu, 8) in current thread."))
+
+        output = scheduler.step()  # used to raise
+
+        assert "req-1" in output.finished_request_ids
+        assert [o.finish_reason for o in output.outputs] == ["error"]
+
+    def test_client_gets_a_typed_error_not_a_stalled_stream(self):
+        """The in-flight request must be failed, not left hanging."""
+        scheduler = _make_scheduler()
+        self._wired(scheduler, RuntimeError("no Stream(gpu, 3)"))
+
+        scheduler.step()
+
+        assert scheduler.running == {}
+
+    def test_it_rebinds_streams_before_resetting(self, caplog):
+        scheduler = _make_scheduler()
+        self._wired(scheduler, RuntimeError("no Stream(gpu, 8) in current thread"))
+
+        with caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+            scheduler.step()
+
+        assert any("stream_thread" in r.getMessage() for r in caplog.records)
+
+    def test_non_stream_errors_keep_their_existing_recovery(self):
+        """The generic OOM/Metal path must be unchanged."""
+        scheduler = _make_scheduler()
+        self._wired(scheduler, RuntimeError("something else entirely"))
+
+        output = scheduler.step()
+
+        assert "req-1" in output.finished_request_ids
+
+
 class TestCacheRecoveryClassification:
     def test_bare_cache_substring_is_not_a_signature(self):
         """The bare word 'cache' matched almost every TypeError."""
