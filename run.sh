@@ -421,6 +421,18 @@ ram_advisory() {   # alias-or-"" , max context
 
 preflight() {
   [[ -x "$PY" ]] || die "no venv interpreter at $PY — run ./scripts/setup.sh first"
+  # Cap MLX's RETAINED-BUFFER cache. Left unset it defaults to the full allocation
+  # limit (`batched.py::_resolve_metal_buffer_cache_limit` returns
+  # `max_recommended * gpu_memory_utilization`), so MLX may hoard every freed buffer
+  # instead of returning it to the OS: at gpu_memory_utilization 0.90 on a 128GB Mac
+  # that is a 103.9GB retained cache. Measured 2026-08-24/25 — wired memory climbed
+  # to 111GB with two models resident (free 0.6GB, swap 61/62GB, 30.8M pageins) and
+  # still reached 86GB over 15h with a single 28GB model. The machine thrashes, every
+  # request crawls, and /v1/status reports the endpoint perfectly healthy throughout.
+  # This caps only what MLX RETAINS; peak allocation is still governed by
+  # --gpu-memory-utilization, so a large model or a long context is unaffected.
+  : "${MLX_BUFFER_CACHE_LIMIT:=17179869184}"   # 16GiB
+  export MLX_BUFFER_CACHE_LIMIT
   # Every .pth in this venv's site-packages can carry the macOS UF_HIDDEN flag, and
   # CPython 3.13's site.addpackage skips hidden .pth files, so the editable install
   # never registers and the `vllm-mlx` console script is inert. PYTHONPATH works.
