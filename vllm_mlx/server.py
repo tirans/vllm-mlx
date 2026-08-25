@@ -1147,39 +1147,74 @@ def _engine_busy_headers(exc: EngineBusy) -> dict[str, str]:
     return {"Retry-After": str(exc.retry_after)}
 
 
-def _anthropic_error_frame(exc: EngineBusy) -> str:
+#: Longest failure text carried in an in-band SSE error frame. The message is a
+#: diagnostic for the client, not a log: an MLX/Metal fault can carry a long
+#: driver string and there is no reason to stream all of it. The full text is
+#: logged server-side by `_ensure_sse_terminal`.
+_STREAM_ERROR_MESSAGE_LIMIT = 500
+
+
+def _stream_error_message(exc: BaseException) -> str:
+    """Client-facing text for a mid-stream failure, bounded in length."""
+    text = str(exc).strip() or exc.__class__.__name__
+    if len(text) > _STREAM_ERROR_MESSAGE_LIMIT:
+        text = text[: _STREAM_ERROR_MESSAGE_LIMIT - 3] + "..."
+    return text
+
+
+def _anthropic_error_frame(exc: BaseException) -> str:
     """In-band SSE error for /v1/messages.
 
     A streaming response commits its status line before the engine is ever
-    called, so an admission failure cannot become a real 503 here -- an SSE
-    frame is the only channel left.
+    called, so neither an admission failure nor an engine fault can become a
+    real 5xx here -- an SSE frame is the only channel left.
+
+    `overloaded_error` is Anthropic's admission-failure type and is wrong for an
+    engine that died; a client must be able to tell "try again shortly" apart
+    from "this engine is broken", so anything that is not `EngineBusy` reports
+    `api_error`.
     """
+    busy = isinstance(exc, EngineBusy)
     payload = {
         "type": "error",
-        "error": {"type": "overloaded_error", "message": str(exc)},
+        "error": {
+            "type": "overloaded_error" if busy else "api_error",
+            "message": _stream_error_message(exc),
+        },
     }
     return f"event: error\ndata: {json.dumps(payload)}\n\n"
 
 
-def _openai_error_frame(exc: EngineBusy) -> str:
+def _openai_error_frame(exc: BaseException) -> str:
     """In-band SSE error for the OpenAI-compatible streaming endpoints."""
     payload = {
         "error": {
-            "message": str(exc),
+            "message": _stream_error_message(exc),
             "type": "server_error",
             "param": None,
-            "code": exc.code,
+            # EngineBusy carries its own code; anything else is the engine
+            # failing mid-generation, which a client must not mistake for a
+            # retryable admission refusal.
+            "code": getattr(exc, "code", None) or "engine_error",
         }
     }
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _responses_error_frame(exc: EngineBusy) -> str:
-    """In-band SSE error for the Responses API stream."""
+def _responses_error_frame(exc: BaseException) -> str:
+    """In-band SSE error for the Responses API stream.
+
+    NOTE: currently unused -- `create_response` builds its StreamingResponse
+    without `_ensure_sse_terminal`, so the Responses stream has neither a
+    guaranteed terminal frame nor an error frame. Same class of bug as the one
+    fixed on the chat/messages paths; left alone here because that path is
+    untested against a live client and this landed inside a narrow deploy
+    window.
+    """
     payload = {
         "type": "error",
-        "code": exc.code,
-        "message": str(exc),
+        "code": getattr(exc, "code", None) or "engine_error",
+        "message": _stream_error_message(exc),
         "param": None,
     }
     return f"event: error\ndata: {json.dumps(payload)}\n\n"
@@ -4483,11 +4518,26 @@ async def _ensure_sse_terminal(
             yield terminal_frame
 
 
-def _busy_error_frame(builder) -> "Callable[[BaseException], str | None]":
-    """Adapt a busy-frame builder into an _ensure_sse_terminal error factory."""
+def _stream_error_frame(builder) -> "Callable[[BaseException], str | None]":
+    """Adapt a frame builder into an `_ensure_sse_terminal` error factory.
+
+    Emits a frame for EVERY failure, not just `EngineBusy`. A streaming response
+    commits its 200 status line before the engine is ever called, so an engine
+    that dies mid-stream cannot become a real 5xx -- and with no in-band frame
+    the client receives a well-formed, EMPTY, *successful-looking* stream.
+
+    That is not hypothetical. On 2026-08-25 a GPU-wedged engine answered 581
+    streaming requests with 200 + empty SSE in 10.5 seconds while the
+    non-streaming path on the same engine returned 503 with a body. The
+    downstream consumer had no way to tell those apart from legitimately empty
+    completions and cached all 581 as artifacts, wiping out a rung of its map.
+
+    This gated on `isinstance(exc, EngineBusy)` and returned None otherwise, so
+    every non-admission failure fell through to the bare terminal frame.
+    """
 
     def _frame(exc: BaseException) -> str | None:
-        return builder(exc) if isinstance(exc, EngineBusy) else None
+        return builder(exc)
 
     return _frame
 
@@ -5006,7 +5056,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                             metrics_tracker=tracker,
                         ),
                         "data: [DONE]\n\n",
-                        _busy_error_frame(_openai_error_frame),
+                        _stream_error_frame(_openai_error_frame),
                     ),
                     raw_request,
                     cleanup=_make_release_cleanup(raw_request),
@@ -5217,7 +5267,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                             **prepared.chat_kwargs,
                         ),
                         "data: [DONE]\n\n",
-                        _busy_error_frame(_openai_error_frame),
+                        _stream_error_frame(_openai_error_frame),
                     ),
                     raw_request,
                     cleanup=_make_release_cleanup(raw_request),
@@ -5639,7 +5689,7 @@ async def create_anthropic_message(
                             metrics_tracker=tracker,
                         ),
                         anthropic_terminal,
-                        _busy_error_frame(_anthropic_error_frame),
+                        _stream_error_frame(_anthropic_error_frame),
                     ),
                     request,
                     cleanup=_make_release_cleanup(request),

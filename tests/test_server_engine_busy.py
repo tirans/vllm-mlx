@@ -242,7 +242,7 @@ class TestEnsureSSETerminal:
                 async for chunk in server._ensure_sse_terminal(
                     boom(),
                     "TERMINAL",
-                    server._busy_error_frame(server._openai_error_frame),
+                    server._stream_error_frame(server._openai_error_frame),
                 )
             ]
 
@@ -250,6 +250,82 @@ class TestEnsureSSETerminal:
         assert chunks[0] == "chunk\n\n"
         assert "text_generation_busy" in chunks[1]
         assert chunks.count("TERMINAL") == 1
+
+    def test_engine_fault_also_gets_an_error_frame(self):
+        """The 2026-08-25 incident: a wedged engine must not look successful.
+
+        A streaming response commits its 200 before the engine is called, so a
+        mid-stream engine fault cannot become a 5xx. With no in-band frame the
+        client sees a well-formed, EMPTY, successful stream -- 581 of those were
+        cached as artifacts by a downstream consumer in 10.5 seconds. This used
+        to return None for anything that was not EngineBusy.
+        """
+        import asyncio
+
+        import vllm_mlx.server as server
+
+        async def wedged():
+            raise RuntimeError(
+                "[METAL] Command buffer execution failed: Ignored (for causing "
+                "prior/excessive GPU errors)"
+            )
+            yield  # pragma: no cover - unreachable, makes this an async generator
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in server._ensure_sse_terminal(
+                    wedged(),
+                    "TERMINAL",
+                    server._stream_error_frame(server._openai_error_frame),
+                )
+            ]
+
+        chunks = asyncio.run(collect())
+        # An error frame BEFORE the terminal, so the stream is not silently empty.
+        assert len(chunks) == 2, chunks
+        assert "METAL" in chunks[0]
+        assert "engine_error" in chunks[0]
+        assert chunks[1] == "TERMINAL"
+
+    def test_engine_fault_is_distinguishable_from_admission_failure(self):
+        """A client must tell "retry shortly" from "this engine is broken"."""
+        import json
+
+        import vllm_mlx.server as server
+
+        busy = json.loads(
+            server._anthropic_error_frame(_busy_error()).split("data: ", 1)[1]
+        )
+        fault = json.loads(
+            server._anthropic_error_frame(RuntimeError("engine died")).split(
+                "data: ", 1
+            )[1]
+        )
+        assert busy["error"]["type"] == "overloaded_error"
+        assert fault["error"]["type"] == "api_error"
+
+        busy_oai = json.loads(
+            server._openai_error_frame(_busy_error()).split("data: ", 1)[1]
+        )
+        fault_oai = json.loads(
+            server._openai_error_frame(RuntimeError("engine died")).split("data: ", 1)[
+                1
+            ]
+        )
+        assert busy_oai["error"]["code"] == "text_generation_busy"
+        assert fault_oai["error"]["code"] == "engine_error"
+
+    def test_error_message_is_bounded(self):
+        """An MLX driver string must not be streamed in full."""
+        import json
+
+        import vllm_mlx.server as server
+
+        frame = server._openai_error_frame(RuntimeError("x" * 5000))
+        msg = json.loads(frame.split("data: ", 1)[1])["error"]["message"]
+        assert len(msg) <= server._STREAM_ERROR_MESSAGE_LIMIT
+        assert msg.endswith("...")
 
     def test_aclose_does_not_raise(self):
         """Yielding from the finally block used to break on client disconnect."""
