@@ -37,6 +37,14 @@
   lowest-priority idle/active resident first; idle time only breaks ties within a tier.
   `/v1/models` now lists every catalog entry, loaded or not, with a `loaded` bool per entry —
   not just what's currently resident.
+- `.multi.memory_budget_gb` is normally left unset in `models.json`: `run.sh` derives it at
+  launch from THIS machine's actual RAM (`RUN_SH_RAM_BUDGET_FRACTION`, default `0.75` of
+  `sysctl hw.memsize`) via `auto_memory_budget_gb`/`effective_memory_budget_gb`, so the same
+  catalog doesn't silently over- or under-commit on a machine other than the one it was
+  tuned on. Set the key explicitly to pin a fixed value again — an explicit value always
+  wins. Bare `./run.sh --multi` (no names) also fits `default_multi` to that same budget by
+  each alias's `size_gb`, in list order, and warns about (or on total failure, `die`s over)
+  anything it had to drop — an explicit `--multi a b` is never trimmed this way.
 - `run.sh`'s own startup warmup (`start_reporter`'s two priming calls to the initially
   preloaded alias) can race a real client request in elastic mode: if a different model is
   requested while warmup is still in flight, the warmup's second call can swap the resident

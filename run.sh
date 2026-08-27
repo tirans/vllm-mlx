@@ -62,6 +62,9 @@
 #   KV_QUANT=0        keep the KV cache at bf16 (2x memory, marginally better quality)
 #   NO_CAFFEINATE=1   don't hold a sleep assertion for the server's lifetime
 #   NO_WAIT=1         don't run the background readiness poller / warm-up
+#   RUN_SH_RAM_BUDGET_FRACTION   fraction of this machine's RAM used as the registry's
+#                     memory_budget_gb when models.json's .multi.memory_budget_gb is
+#                     unset (default 0.75). Ignored once that key is pinned.
 
 set -euo pipefail
 
@@ -419,6 +422,28 @@ ram_advisory() {   # alias-or-"" , max context
   fi
 }
 
+# .multi.memory_budget_gb is the registry manager's eviction ceiling on resident
+# weight footprint, not total system RAM — it must leave room for KV cache,
+# request batching, the OS, and other colocated services (see
+# docs/guides/model-registry.md). Deriving it from this machine's actual RAM
+# instead of a hardcoded number in models.json means the same catalog scales
+# sanely on a different machine instead of over- or under-committing.
+RUN_SH_RAM_BUDGET_FRACTION="${RUN_SH_RAM_BUDGET_FRACTION:-0.75}"
+auto_memory_budget_gb() {
+  local ram_gib
+  ram_gib=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  awk -v r="$ram_gib" -v f="$RUN_SH_RAM_BUDGET_FRACTION" 'BEGIN { printf "%d", r * f }'
+}
+
+# The value actually handed to the registry: an explicit .multi.memory_budget_gb
+# in models.json still pins it (unchanged behavior); otherwise it's auto-sized
+# from RAM. Single source of truth so the registry we generate and the log line
+# reporting it can never disagree.
+effective_memory_budget_gb() {
+  local pinned; pinned="$(multiget memory_budget_gb)"
+  if [[ -n "$pinned" ]]; then printf '%s' "$pinned"; else auto_memory_budget_gb; fi
+}
+
 preflight() {
   [[ -x "$PY" ]] || die "no venv interpreter at $PY — run ./scripts/setup.sh first"
   # Cap MLX's RETAINED-BUFFER cache. Left unset it defaults to the full allocation
@@ -617,11 +642,12 @@ serve_multi() {
   # is a superset of JSON, so a plain JSON document is a valid registry file. No
   # YAML emitter needed. Shape validated against load_registry_config.
   local reg="${TMPDIR:-/tmp}/vllm-mlx-registry-$port.json"
-  jq -n --slurpfile cfg "$CONFIG" --arg max_resident "$MAX_RESIDENT_OVERRIDE" --args '
+  local mem_budget; mem_budget="$(effective_memory_budget_gb)"
+  jq -n --slurpfile cfg "$CONFIG" --arg max_resident "$MAX_RESIDENT_OVERRIDE" --arg mem_budget "$mem_budget" --args '
     $cfg[0] as $c
     | ($ARGS.positional) as $sel
     | { manager: {
-          memory_budget_gb: ($c.multi.memory_budget_gb // 64),
+          memory_budget_gb: ($mem_budget | tonumber),
           contention_policy: ($c.multi.contention_policy // {strategy: "wait_then_fail"}),
           max_resident_models: (
             if $max_resident != "" then ($max_resident | tonumber)
@@ -663,9 +689,11 @@ serve_multi() {
   # and warming them all would defeat the memory budget by making them all resident.
   local mr_display="${MAX_RESIDENT_OVERRIDE:-$(multiget max_resident_models)}"
   [[ -n "$mr_display" ]] || mr_display="unbounded"
+  local mem_budget_src="auto, ${RUN_SH_RAM_BUDGET_FRACTION} of this machine's RAM"
+  [[ -n "$(multiget memory_budget_gb)" ]] && mem_budget_src="pinned in models.json"
   start_reporter "$host" "$port" "${sel[0]}" 1
   note "starting ${#sel[@]} models on http://$host:$port — ${sel[*]}"
-  note "  '${sel[0]}' loads now; the rest of the catalog loads on first use, budget $(multiget memory_budget_gb) GB, max resident $mr_display, policy $(jq -r '.multi.contention_policy.strategy' "$CONFIG")"
+  note "  '${sel[0]}' loads now; the rest of the catalog loads on first use, budget ${mem_budget} GB ($mem_budget_src), max resident $mr_display, policy $(jq -r '.multi.contention_policy.strategy' "$CONFIG")"
   launch "${args[@]}" "$@"
 }
 
@@ -806,7 +834,28 @@ if [[ "$MODE" == "multi" ]] && [[ ${#SEL[@]} -eq 0 ]] && (( WANT_ALL == 0 )); th
   while IFS= read -r a; do
     [[ -n "$a" ]] && SEL+=("$a")
   done < <(default_multi)
-  [[ ${#SEL[@]} -gt 0 ]] && note "--multi given no names — using the configured default set: ${SEL[*]}"
+  if [[ ${#SEL[@]} -gt 0 ]]; then
+    # An implicit set gets fitted to what THIS machine can actually hold, using
+    # each catalog entry's size_gb and the effective (auto-or-pinned) memory
+    # budget — same reasoning as .multi.memory_budget_gb itself, so the default
+    # set doesn't blindly assume this is the 128 GB machine it was written on.
+    # An explicit `--multi a b` is a direct request and is never trimmed this way.
+    BUDGET_GB="$(effective_memory_budget_gb)"
+    FITTED=(); DROPPED=(); RUNNING_GB=0
+    for a in "${SEL[@]}"; do
+      SZ_GB="$(mget "$a" size_gb)"; [[ -n "$SZ_GB" ]] || SZ_GB=8
+      if (( RUNNING_GB + SZ_GB <= BUDGET_GB )); then
+        FITTED+=("$a"); RUNNING_GB=$(( RUNNING_GB + SZ_GB ))
+      else
+        DROPPED+=("$a")
+      fi
+    done
+    SEL=("${FITTED[@]}")
+    [[ ${#SEL[@]} -gt 0 ]] || die "the default set ${DROPPED[*]} does not fit the ${BUDGET_GB} GB memory budget — name a smaller model explicitly"
+    note "--multi given no names — using the configured default set: ${SEL[*]} (~${RUNNING_GB} of ${BUDGET_GB} GB budget)"
+    [[ ${#DROPPED[@]} -eq 0 ]] ||
+      warn "dropped from the default set, would exceed the ${BUDGET_GB} GB memory budget: ${DROPPED[*]} — name it explicitly to force it"
+  fi
 fi
 
 if [[ ${#SEL[@]} -eq 0 ]]; then

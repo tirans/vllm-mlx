@@ -36,6 +36,12 @@
       "",
       "memory_budget_gb is what makes 'load both, or evict one' a runtime decision:",
       "models load lazily and are evicted per contention_policy when the budget is tight.",
+      "Left unset (as here), run.sh derives it at launch time from THIS machine's actual",
+      "RAM (RUN_SH_RAM_BUDGET_FRACTION, default 0.75x hw.memsize) instead of a number that",
+      "would silently over- or under-commit on a different Mac — set it explicitly here to",
+      "pin a fixed value again. Either way `--multi` with no names on the command line also",
+      "trims default_multi (below) to whatever combination of it fits that budget, by each",
+      "model's size_gb, warning about anything it had to drop.",
       "max_resident_models is a second, count-based cap alongside the byte budget — set",
       "to 1 to force exactly one resident model regardless of how much budget is left",
       "(that's what bare `./run.sh <name>` uses); leave null/omitted for `--multi` so it",
@@ -53,7 +59,6 @@
       "resident measurably capped GPU utilization, so bare `./run.sh` went back to one."
     ],
     "port": 8000,
-    "memory_budget_gb": 96,
     "max_resident_models": null,
     "default_multi": ["reasoning-30b", "qwen3.8-27b"],
     "contention_policy": {
