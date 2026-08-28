@@ -595,6 +595,57 @@ def _dequantize_cache(cache: list[Any]) -> list[Any]:
     return result
 
 
+def _eval_cache_layers(cache: list[Any]) -> list[Any]:
+    """Force every KV array in ``cache`` to a concrete buffer, on the calling thread.
+
+    MLX >= 0.32 registers streams per thread, so an unevaluated op graph can only be
+    evaluated by the thread that built it. The prefix cache is handed between two
+    threads on every request -- ``fetch`` runs on the asyncio event-loop thread (via
+    ``Scheduler.add_request``) while the arrays are first read inside ``step`` on the
+    engine-core worker thread -- so anything still lazy at that hand-off raises
+    ``RuntimeError: There is no Stream(gpu, N) in current thread`` and the engine
+    aborts the request mid-generation. That was a permanent crash loop, not a
+    flake: every hit re-poisoned a fresh graph, so restarting the server changed
+    nothing (2026-08-27; 10/10 crashes followed a HIT, 0/6 cold requests crashed).
+
+    Evaluating at the seam is sufficient, and measurably so: concrete buffers move
+    between threads fine, only op graphs do not. See
+    ``tests/test_memory_cache_thread_affinity.py::TestThreadAffinityMechanism``,
+    which pins that property so a future MLX change cannot quietly invalidate it.
+
+    This does not copy and does not change what is returned -- ``mx.eval`` only
+    forces evaluation in place, so the caller's aliasing semantics (a copy for the
+    quantized path, a shared reference for the plain one) are exactly as before.
+    """
+    import mlx.core as mx
+
+    targets = []
+    for layer in cache:
+        for attr in ("keys", "values"):
+            arr = getattr(layer, attr, None)
+            if arr is None:
+                continue
+            # Quantized layers hold (w, scales, biases) -- a list on MLX 0.32, a
+            # tuple on older builds. Each element needs evaluating.
+            if isinstance(arr, (tuple, list)):
+                targets.extend(a for a in arr if a is not None)
+            else:
+                targets.append(arr)
+    if targets:
+        mx.eval(*targets)
+    return cache
+
+
+def _prepare_for_stepping_thread(cache: list[Any], dequantize: bool) -> list[Any]:
+    """Dequantize if configured, then make the result safe to cross a thread.
+
+    Every ``fetch`` hit path goes through here. Adding a sixth hit path that does not
+    is how this bug comes back.
+    """
+    out = _dequantize_cache(cache) if dequantize else cache
+    return _eval_cache_layers(out)
+
+
 def _compute_model_fingerprint(model: Any) -> str:
     """Compute a fingerprint from model architecture for cache compatibility.
 
@@ -732,10 +783,8 @@ class MemoryAwarePrefixCache:
             self._stats.hits += 1
             self._stats.tokens_saved += len(tokens)
             self._last_match_type = "exact"
-            cache_out = (
-                _dequantize_cache(entry.cache)
-                if self._config.kv_quantize
-                else entry.cache
+            cache_out = _prepare_for_stepping_thread(
+                entry.cache, self._config.kv_quantize
             )
             return cache_out, []
 
@@ -807,10 +856,8 @@ class MemoryAwarePrefixCache:
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
-                trimmed_cache = (
-                    _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
-                    else trimmed_cache
+                trimmed_cache = _prepare_for_stepping_thread(
+                    trimmed_cache, self._config.kv_quantize
                 )
                 return trimmed_cache, []
             else:
@@ -818,10 +865,8 @@ class MemoryAwarePrefixCache:
                 self._stats.hits += 1
                 self._stats.tokens_saved += n_requested
                 self._last_match_type = "supersequence"
-                cache_out = (
-                    _dequantize_cache(best_super.cache)
-                    if self._config.kv_quantize
-                    else best_super.cache
+                cache_out = _prepare_for_stepping_thread(
+                    best_super.cache, self._config.kv_quantize
                 )
                 return cache_out, []
 
@@ -832,10 +877,8 @@ class MemoryAwarePrefixCache:
             self._stats.tokens_saved += best_length
             remaining = tokens[best_length:]
             self._last_match_type = "prefix"
-            cache_out = (
-                _dequantize_cache(best_match.cache)
-                if self._config.kv_quantize
-                else best_match.cache
+            cache_out = _prepare_for_stepping_thread(
+                best_match.cache, self._config.kv_quantize
             )
             return cache_out, remaining
 
@@ -916,10 +959,8 @@ class MemoryAwarePrefixCache:
                     f"trimmed={excess} remaining={len(remaining)}"
                 )
                 self._last_match_type = "lcp"
-                trimmed_cache = (
-                    _dequantize_cache(trimmed_cache)
-                    if self._config.kv_quantize
-                    else trimmed_cache
+                trimmed_cache = _prepare_for_stepping_thread(
+                    trimmed_cache, self._config.kv_quantize
                 )
                 return trimmed_cache, remaining
 
@@ -979,6 +1020,12 @@ class MemoryAwarePrefixCache:
                 cache = _quantize_cache(
                     cache, self._config.kv_bits, self._config.kv_group_size
                 )
+                # `_quantize_cache` only builds lazy `mx.quantize` ops. Storing them
+                # unevaluated binds the ENTRY to whichever thread called store(), so a
+                # later fetch is poisoned before it dequantizes anything -- evaluating
+                # only at fetch time would fix half the bug. Same producer-thread rule
+                # as 967d4f3.
+                _eval_cache_layers(cache)
 
             # Create entry and estimate memory
             entry = _CacheEntry.create(tokens, cache)
