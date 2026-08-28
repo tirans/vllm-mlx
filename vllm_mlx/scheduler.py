@@ -1373,6 +1373,27 @@ class Scheduler:
                     stop_tokens.add(tok.eos_token_ids)
         return stop_tokens
 
+    def _clear_prefix_caches(self) -> int:
+        """Drop every prefix cache tier. Returns how many were cleared.
+
+        Used by stream-fault recovery: a cached entry is the only state that
+        survives a batch-generator reset, so leaving it in place is what lets one
+        fault re-poison the next request, and the one after that.
+        """
+        cleared = 0
+        for cache in (
+            self.memory_aware_cache,
+            self.prefix_cache,
+            self.block_aware_cache,
+        ):
+            if cache is None:
+                continue
+            clear = getattr(cache, "clear", None)
+            if callable(clear):
+                clear()
+                cleared += 1
+        return cleared
+
     def _create_batch_generator(
         self, sampling_params: SamplingParams
     ) -> BatchGenerator:
@@ -2873,19 +2894,30 @@ class Scheduler:
                     # the batch generator's cached state references the stream
                     # that just went away, so recovery has to re-establish
                     # ownership first or the reset itself can fault.
+                    #
+                    # Then DROP THE PREFIX CACHE. A cached entry is the only state
+                    # that survives the batch-generator reset, and a stale entry is
+                    # what turns one stream fault into a loop: the 2026-08-27
+                    # incident crashed on 10 consecutive cache HITs and 0 cold
+                    # requests, so every recovery handed the next request the same
+                    # poison. Clearing costs one slow re-prefill and bounds any
+                    # novel stream fault to a single request.
                     try:
                         from .mlx_streams import bind_generation_streams
 
                         bind_generation_streams()
+                        cleared = self._clear_prefix_caches()
                         logger.warning(
-                            "[stream_thread] rebound generation streams and reset "
-                            "the batch generator; failing in-flight requests so "
-                            "clients get a typed error instead of a stalled stream"
+                            "[stream_thread] rebound generation streams, reset the "
+                            "batch generator and cleared %s prefix cache(s); "
+                            "failing in-flight requests so clients get a typed "
+                            "error instead of a stalled stream",
+                            cleared,
                         )
                     except Exception:
                         logger.warning(
-                            "[stream_thread] stream rebind failed; resetting the "
-                            "batch generator anyway",
+                            "[stream_thread] stream rebind or cache clear failed; "
+                            "resetting the batch generator anyway",
                             exc_info=True,
                         )
                 # Recover from fatal errors (OOM, Metal crash) instead of
@@ -3220,8 +3252,7 @@ class Scheduler:
                 self._ssd_tier._stats.promotion_failures += 1
                 request.cache_hit_type = "miss"
                 logger.exception(
-                    f"[ssd_promote] request={request.request_id[:12]} "
-                    f"disk read failed"
+                    f"[ssd_promote] request={request.request_id[:12]} disk read failed"
                 )
                 continue
 

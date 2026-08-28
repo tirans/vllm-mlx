@@ -89,9 +89,25 @@
   clients queue, then 503 after `VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S` (default 120s).
 - `--max-kv-size > 0` switches mlx to `RotatingKVCache`: silently drops oldest tokens AND
   disqualifies prefix caching. Leave unset to keep full context.
-- First prefix-cache HIT after startup logs `Detected MLX stream/thread mismatch`, runs cache
-  recovery, and re-prefills that request WITHOUT its cache (4.4s vs 0.32s on an 11k turn).
-  Warm up with two requests >2k tokens before trusting any measurement.
+- **A prefix-cache HIT crosses a thread boundary, and anything lazy dies there.** `fetch()`
+  runs on the asyncio event-loop thread (`Scheduler.add_request`); the arrays are first read
+  inside `step()` on the engine-core worker thread. MLX >= 0.32 registers streams per thread,
+  so an op graph built on one cannot be evaluated on the other -- it raises
+  `RuntimeError: There is no Stream(gpu, N) in current thread`, which clients see as "the
+  engine aborted this request while generating". `fetch()` and `store()` therefore `mx.eval`
+  on their own thread (`_prepare_for_stepping_thread`); a sixth hit path that skips it brings
+  the bug back. Guarded by `tests/test_memory_cache_thread_affinity.py`.
+  - This entry used to read "first HIT after startup logs `Detected MLX stream/thread
+    mismatch`, runs cache recovery, and re-prefills without its cache — warm up with two
+    requests". That was wrong in a way that cost a day. It described a one-off hiccup with a
+    self-heal, so a crash LOOP read as the known-benign warm-up. In fact EVERY hit crashed,
+    forever: each one poisons a fresh graph, so restarting the endpoint changes nothing.
+    Measured 2026-08-27 -- 10/10 crashes followed a HIT, 0/6 cold requests crashed, and a
+    downstream map died 42 consecutive times. The `Detected MLX stream/thread mismatch`
+    message it told you to expect appeared **0 times** in that incident's log: it comes from
+    an `engine_core` fallback that `ee8af4f` made unreachable (`step()` stopped re-raising),
+    and it has since been deleted. If a doc names a log line as the symptom, grep the log for
+    it before believing the doc.
 - Prompts under ~2k tokens log `stored=False` — too small to enter the prefix cache.
 - Prefill is O(n^2): 8k->2.5s, 32k->19s, 64k->74s, 131k->~5min. `/v1/status` stops
   answering entirely during a large prefill.
