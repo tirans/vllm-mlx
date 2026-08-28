@@ -140,8 +140,24 @@ class EngineCore:
     async def _engine_loop(self) -> None:
         """Main engine loop.
 
-        scheduler.step runs on one dedicated worker thread, always. MLX streams are
-        thread-local, so generation streams are bound once inside that worker.
+        scheduler.step runs on one dedicated worker thread, always, and this loop
+        deliberately does NOT bind MLX generation streams to that worker.
+
+        It used to. `bind_generation_streams()` creates a fresh `mx.new_stream()` --
+        which MLX registers in the *calling* thread -- and then publishes it into the
+        module-level `mlx_lm.generate.generation_stream` that every engine in the
+        process shares. So an engine arriving at its worker replaced a stream that
+        works everywhere with one that works only on that worker: measured, the main
+        thread afterwards cannot use `generation_stream` at all
+        (`There is no Stream(gpu, 1) in current thread`). With `--multi` that is one
+        engine reaching into another engine's in-flight generation. mlx-lm's own
+        default is a `ThreadLocalStream`, which is already correct for every thread;
+        overwriting it was strictly a downgrade.
+
+        What actually made the worker safe is upstream of here: `Scheduler.__init__`
+        materializes the model's arrays on the constructing thread
+        (`materialize_model_arrays`), so no half-built op graph is left for the
+        worker to finish. Without that the bind only *appeared* to help.
 
         There used to be a fallback here that, on a stream/thread mismatch, moved
         stepping onto the event-loop thread instead. It has been removed because it
@@ -156,16 +172,8 @@ class EngineCore:
 
         loop = asyncio.get_running_loop()
         worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
-        worker_stream_bound = False
-
-        def _bind_worker_streams_once() -> None:
-            nonlocal worker_stream_bound
-            if not worker_stream_bound:
-                bind_generation_streams()
-                worker_stream_bound = True
 
         def _step_on_worker():
-            _bind_worker_streams_once()
             output = self.scheduler.step()
             self._steps_executed += 1
 
@@ -185,11 +193,9 @@ class EngineCore:
             return output
 
         def _clear_cache_on_worker() -> None:
-            _bind_worker_streams_once()
             mx.clear_cache()
 
         def _close_batch_generator_on_worker() -> None:
-            _bind_worker_streams_once()
             self.scheduler._close_batch_generator()
 
         step_interval = self.config.step_interval

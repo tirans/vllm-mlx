@@ -87,20 +87,6 @@ async def test_engine_core_no_cross_thread_stream_error(model_and_tokenizer, cap
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Blocked by a PRE-EXISTING failure in this file, not by the cache fix: "
-        "test_engine_core_no_cross_thread_stream_error is red on this machine at "
-        "least as far back as the commit before the cache fix, with the same "
-        "`no Stream(gpu, 0)` from mlx_lm generate.py:1161. In these tests the model "
-        "is loaded by a module fixture on the MAIN thread while the engine steps on "
-        "its worker, so the fault fires during prefill and the request never "
-        "reaches a cache hit. The server does not load models that way, which is "
-        "why the endpoint runs. Unmark once the fixture-thread issue is fixed -- "
-        "strict=False, so this reports XPASS rather than silently passing."
-    ),
-    strict=False,
-)
 @pytest.mark.anyio
 async def test_prefix_cache_hit_survives_engine_threads(model_and_tokenizer, caplog):
     """A prefix-cache HIT must generate, not abort the request it hit on.
@@ -179,3 +165,71 @@ async def test_prefix_cache_hit_survives_engine_threads(model_and_tokenizer, cap
     assert streamed[1][1] != "error", (
         f"the cache-hit request was aborted by the scheduler: {streamed}"
     )
+
+
+def test_a_model_first_used_off_its_loading_thread_needs_materializing():
+    """The invariant `Scheduler.__init__` upholds, pinned directly.
+
+    `mlx_lm.load` leaves some of a module's arrays unevaluated, and MLX >= 0.32 will
+    not finish an op graph from a thread other than the one that built it. So a model
+    loaded on thread A and *first used* on thread B dies during that first forward --
+    which is exactly the engine's shape, since callers load wherever they happen to be
+    and `EngineCore` steps on its own worker.
+
+    Both halves are asserted, because the interesting half is the negative one: this
+    is why `mx.eval(model.parameters())` is not the fix. The arrays at fault are not
+    parameters -- they are the module's other buffers (rope frequencies, masks) built
+    in `__init__` -- and only `Module.state` reaches them.
+
+    Loads its own copy rather than using the module fixture: that one has already been
+    used by the tests above, so it is materialized and would pass either way.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import mlx.core as mx
+
+    try:
+        from mlx_lm import load
+        from mlx_lm.models.cache import make_prompt_cache
+    except Exception as e:  # pragma: no cover
+        pytest.skip(f"mlx_lm unavailable: {e}")
+
+    if not hasattr(mx, "clear_streams"):  # pragma: no cover
+        pytest.skip("requires MLX >= 0.32, where streams are registered per thread")
+
+    from vllm_mlx.mlx_streams import materialize_model_arrays
+
+    def first_forward(model, tokenizer):
+        cache = make_prompt_cache(model)
+        tokens = mx.array([tokenizer.encode("Hello there, how are you today?")])
+        model(tokens, cache=cache)
+        mx.eval([c.state for c in cache])
+        return "ok"
+
+    def load_here():
+        assert threading.get_ident() is not None
+        return load(TEST_MODEL)
+
+    # --- negative: parameters() is not enough --------------------------------
+    loader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="loader")
+    stepper = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stepper")
+    try:
+        model, tokenizer = loader.submit(load_here).result()
+        loader.submit(lambda: mx.eval(model.parameters())).result()
+        with pytest.raises(RuntimeError, match=r"no Stream\("):
+            stepper.submit(first_forward, model, tokenizer).result()
+    finally:
+        loader.shutdown(wait=True)
+        stepper.shutdown(wait=True)
+
+    # --- positive: Module.state is ------------------------------------------
+    loader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="loader")
+    stepper = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stepper")
+    try:
+        model, tokenizer = loader.submit(load_here).result()
+        assert loader.submit(materialize_model_arrays, model).result() is True
+        assert stepper.submit(first_forward, model, tokenizer).result() == "ok"
+    finally:
+        loader.shutdown(wait=True)
+        stepper.shutdown(wait=True)

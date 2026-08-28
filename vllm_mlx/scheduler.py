@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
 from mlx_lm.generate import BatchGenerator
+
+from .mlx_streams import materialize_model_arrays
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
@@ -1236,6 +1238,16 @@ class Scheduler:
             "VLLM_MLX_STALL_WARN_S", DEFAULT_STALL_WARN_S
         )
         self._stall_warned = False
+
+        # Make every array the model holds concrete NOW, on this thread. The engine
+        # steps on its own worker thread, and MLX >= 0.32 will not evaluate an op
+        # graph from a thread other than the one that built it -- so a model loaded
+        # on the caller's thread and first used on the worker dies with
+        # "There is no Stream(gpu, N) in current thread" during its first prefill.
+        # `mlx_lm.load` leaves some non-parameter buffers (rope frequencies, masks)
+        # unevaluated, which is why `mx.eval(model.parameters())` does not cover it.
+        # Costs nothing net: those arrays are evaluated on first forward anyway.
+        materialize_model_arrays(model)
 
         # BatchGenerator - the actual batching engine
         self.batch_generator: Optional[BatchGenerator] = None

@@ -63,8 +63,18 @@ async def test_engine_core_runs_all_scheduler_steps_on_one_worker_thread(monkeyp
     assert scheduler.step_threads
     assert len(set(scheduler.step_threads)) == 1
     assert scheduler.step_threads[0] != main_thread
-    assert bind_threads == [scheduler.step_threads[0]]
     assert scheduler.close_threads == [scheduler.step_threads[0]]
+    # The engine loop must NOT bind generation streams. `bind_generation_streams`
+    # publishes a thread-affine `mx.new_stream()` into the module-level
+    # `mlx_lm.generate.generation_stream` that every engine in the process shares, so
+    # one engine reaching its worker leaves that global unusable from any other
+    # thread -- measured, the main thread then gets `There is no Stream(gpu, 1) in
+    # current thread`. Under `--multi` that is one engine clobbering another's
+    # in-flight generation. mlx-lm's own default there is a `ThreadLocalStream`,
+    # already correct per thread; the bind was strictly a downgrade. What makes the
+    # worker safe instead is `Scheduler.__init__` materializing the model's arrays on
+    # the constructing thread. See test_engine_core_stream_safety.py.
+    assert bind_threads == []
 
 
 @pytest.mark.anyio
