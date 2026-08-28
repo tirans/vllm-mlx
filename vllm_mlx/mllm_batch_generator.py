@@ -472,9 +472,6 @@ class MLLMBatchGenerator:
         ...         print(f"Request {resp.request_id}: token={resp.token}")
     """
 
-    # Generation stream for async eval
-    _stream = None
-
     def __init__(
         self,
         model: nn.Module,
@@ -614,9 +611,19 @@ class MLLMBatchGenerator:
         # Stripping the suffix from cache keys enables clean PREFIX match.
         self._think_suffix_len = self._compute_think_suffix_len()
 
-        # Generation stream
-        if MLLMBatchGenerator._stream is None:
-            MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
+        # Generation stream for async eval -- per INSTANCE, minted here on the
+        # constructing thread. It was a class attribute until 2026-08-28: the
+        # first instance's thread created it and every later instance in the
+        # process reused it, but MLX >= 0.32 registers a stream in the creating
+        # thread only, so a second engine built on another thread (--multi with
+        # two MLLM models) could neither step inside `with mx.stream(...)` nor
+        # even close() -- `mx.synchronize` raised `There is no Stream(gpu, N) in
+        # current thread` and the wired-limit restore below it never ran. The
+        # constructing thread is the stepping thread (`_ensure_batch_generator`
+        # runs inside `step()`), which is what makes per-instance correct here.
+        # Same defect shape as the deleted `bind_generation_streams`: a
+        # thread-affine stream in cross-thread-visible storage.
+        self._stream = mx.new_stream(mx.default_device())
 
         # Memory management
         self._old_wired_limit = None
@@ -754,7 +761,7 @@ class MLLMBatchGenerator:
     def close(self) -> None:
         """Release resources and reset wired limit."""
         if self._old_wired_limit is not None:
-            mx.synchronize(MLLMBatchGenerator._stream)
+            mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
@@ -1444,7 +1451,7 @@ class MLLMBatchGenerator:
                     total_tokens = len(input_ids_list)
                     remaining_count = len(remaining_ids)
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with mx.stream(self._stream):
                         step = self.prefill_step_size
                         if remaining_count <= step:
                             # Short remaining — process in one shot
@@ -1524,7 +1531,7 @@ class MLLMBatchGenerator:
                         total_tokens,
                     )
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with mx.stream(self._stream):
                         logits = self.language_model(last_token, cache=request_cache)
                         if hasattr(logits, "logits"):
                             logits = logits.logits
@@ -1550,7 +1557,7 @@ class MLLMBatchGenerator:
                         max_kv_size=self.max_kv_size or None,
                     )
 
-                    with mx.stream(MLLMBatchGenerator._stream):
+                    with mx.stream(self._stream):
                         # Text-only: chunked prefill with real progress tracking
                         # Multimodal: atomic VLM forward (vision encoder needs full input)
                         if req.is_text_only:
@@ -1964,7 +1971,7 @@ class MLLMBatchGenerator:
         Returns:
             List of MLLMBatchResponse, one per active request
         """
-        with mx.stream(MLLMBatchGenerator._stream):
+        with mx.stream(self._stream):
             return self._next()
 
     def stats(self) -> MLLMBatchStats:

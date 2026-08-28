@@ -143,7 +143,7 @@
 
 ## Testing
 
-- **The suite goes green: 2383 passed / 0 failed, in forward and reverse file order.** It
+- **The suite goes green: 0 failed (2385 passed as of 2026-08-28), in forward and reverse file order.** It
   did not until 2026-08-28 — `main` was 6 failed / 2376 passed with every failure passing in
   isolation, because `bind_generation_streams()` poisoned the process-wide
   `mlx_lm.generate.generation_stream` and whichever engine test ran after
@@ -151,11 +151,16 @@
   A red test is now a real signal again, so treat one as your change until proven otherwise —
   but confirm order-independence (`pytest -q $(ls -r tests/test_*.py)`) before blaming it on
   ordering, and `git stash push -- vllm_mlx tests` before concluding it is pre-existing.
-- **Nothing may assign to `mlx_lm.generate.generation_stream`.** It is an
-  `mx.ThreadLocalStream`, already correct from every thread; overwriting it with an
-  `mx.new_stream()` binds it to one thread and breaks every other. Guarded two ways in
-  `tests/test_engine_core_thread_streams.py` — the live object's type, and a source scan of
-  `vllm_mlx/` that catches a reintroduction even from code the suite never executes.
+- **Nothing may assign to `mlx_lm.generate.generation_stream`, and no `mx.new_stream()` may
+  live in cross-thread-visible storage** (a class attribute, a module global). The stream is
+  registered in the creating thread only; any other thread using it dies at its first op —
+  note *op*, not context entry: `with mx.stream(s): pass` succeeds cross-thread, which is how
+  `MLLMBatchGenerator`'s shared class-level `_stream` stayed latent (fixed 2026-08-28:
+  per-instance, minted on the constructing thread; a second `--multi` MLLM engine could
+  neither step nor even `close()`). Guarded in `tests/test_engine_core_thread_streams.py` —
+  the live `generation_stream` type, a source scan of `vllm_mlx/` that catches a
+  reintroduced assignment even from code the suite never executes, and a behavioral
+  two-thread test that catches re-shared MLLM streams under any attribute name.
 - **Format only the files you touched.** The repo is not format-clean, so `ruff format <dir>`
   reformats 50+ unrelated files straight into your diff. Use `ruff format path/to/one.py`.
 - **MLX threading probes must use persistent threads** (`ThreadPoolExecutor(max_workers=1)`),

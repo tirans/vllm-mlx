@@ -890,6 +890,9 @@ class TestMLLMBatchGeneratorMTPGuards:
         )
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        # _stream is per-instance now (minted on the constructing thread), so a
+        # fabricated instance must carry it; the patched mx.stream ignores it.
+        generator._stream = None
         generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []
