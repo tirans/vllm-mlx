@@ -167,6 +167,14 @@
   never a bare `threading.Thread` per step — an exited thread takes its stream registry with
   it, so ephemeral threads fail for a second, unrelated reason and make a broken fix look
   tested.
+- `MLLMBatchGenerator` constructs with plain fake model/processor objects — no VLM weights
+  (the template/think-suffix helpers exception-guard themselves; pair with `close()` on the
+  constructing thread to restore the wired limit). "Needs a live VLM" deferred a real
+  stream-seam fix once; the seam fires before any forward pass.
+- `test_mllm_continuous_batching.py` fabricates generators via `MLLMBatchGenerator.__new__`
+  at 8 sites, hand-setting only the attributes the tested path touches — a new per-instance
+  attribute breaks whichever double reaches it. Complete the double; don't run `__init__`.
+- The full suite is ~32 s. Run it whole (both orders) instead of guessing affected files.
 
 ## Benchmarking
 
