@@ -99,3 +99,6 @@ temp/
 
 # personal Claude Code notes (loaded via @-import in CLAUDE.md)
 .claude.local.md
+
+# Claude Code runtime state (a live session lock, not configuration)
+.claude/scheduled_tasks.lock
