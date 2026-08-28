@@ -51,14 +51,9 @@ from .base import (
     suspend_cancellation,
 )
 from .chat_template_safety import normalize_messages_for_chat_template
-from ..mlx_streams import bind_generation_streams
+from ..mlx_streams import materialize_model_arrays
 
 logger = logging.getLogger(__name__)
-
-
-def _bind_worker_generation_streams() -> None:
-    """Rebind mlx generation streams inside the current worker thread."""
-    bind_generation_streams()
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
@@ -583,6 +578,16 @@ class SimpleEngine(BaseEngine):
 
         self._model.load()
 
+        # Make every array the model holds concrete NOW, on the thread that just
+        # loaded it. `mlx_lm.load` leaves some non-parameter buffers (rope
+        # frequencies, masks) lazy, and MLX >= 0.32 will not finish an op graph from
+        # a thread other than the one that built it -- so a model loaded here and
+        # first *used* inside `_run_blocking_serialized`'s `asyncio.to_thread` worker
+        # dies during that first forward with "There is no Stream(gpu, N) in current
+        # thread". Same rule `Scheduler.__init__` upholds; costs nothing net, since
+        # those arrays are evaluated on the first forward regardless.
+        materialize_model_arrays(getattr(self._model, "model", self._model))
+
     def _uses_default_prepare_for_start(self) -> bool:
         """Return True when prepare_for_start is the class implementation."""
         method = getattr(self.prepare_for_start, "__func__", None)
@@ -632,6 +637,8 @@ class SimpleEngine(BaseEngine):
                     self._text_model = build_text_model(
                         self._model.model, self._model_name
                     )
+                    # Built here, on the loop thread; first used from a worker.
+                    materialize_model_arrays(self._text_model)
 
                     if self._text_model is not None:
                         self._text_tokenizer = self._model.get_tokenizer()
@@ -715,6 +722,7 @@ class SimpleEngine(BaseEngine):
                     self._draft_model, _ = mlx_lm_load(
                         self._specprefill_draft_model_path
                     )
+                    materialize_model_arrays(self._draft_model)
                     logger.info(
                         "SpecPrefill: draft model loaded (%s), threshold=%d, keep=%.0f%%",
                         self._specprefill_draft_model_path,
@@ -798,11 +806,7 @@ class SimpleEngine(BaseEngine):
                 "started_at": started_at,
             }
 
-            def run_bound():
-                _bind_worker_generation_streams()
-                return func(*args, **kwargs)
-
-            task = asyncio.create_task(asyncio.to_thread(run_bound))
+            task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
             try:
                 return await asyncio.shield(task)
             except asyncio.CancelledError:
@@ -1086,11 +1090,6 @@ class SimpleEngine(BaseEngine):
                 "elapsed_s": 0.0,
                 "started_at": started_at,
             }
-            # Non-stream chat runs in a worker thread and rebinds generation
-            # streams there. Rebind again on the current thread before
-            # stream_generate so nonstream->stream mode switches remain valid.
-            _bind_worker_generation_streams()
-
             try:
                 accumulated_text = ""
                 prompt_tokens = 0
@@ -1424,7 +1423,6 @@ class SimpleEngine(BaseEngine):
                         "started_at": time.time(),
                     }
                     try:
-                        _bind_worker_generation_streams()
                         for chunk in self._model.stream_chat(
                             messages=messages,
                             max_tokens=max_tokens,

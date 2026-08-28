@@ -1191,7 +1191,6 @@ class TestSimpleEngineConcurrency:
             )
 
         with (
-            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
             patch(
                 "mlx_lm.models.cache.make_prompt_cache",
                 return_value=["backbone-cache"],
@@ -1302,7 +1301,6 @@ class TestSimpleEngineConcurrency:
             )
 
         with (
-            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
             patch(
                 "mlx_lm.models.cache.make_prompt_cache",
                 return_value=["backbone-cache"],
@@ -1647,30 +1645,43 @@ class TestSimpleEngineConcurrency:
             assert isinstance(engine._generation_lock, asyncio.Lock)
 
     @pytest.mark.anyio
-    async def test_run_blocking_serialized_rebinds_worker_generation_streams(self):
-        """Worker-thread MLX generation should get fresh thread-local streams."""
+    async def test_run_blocking_serialized_leaves_the_shared_stream_alone(self):
+        """A worker uses mlx-lm's ThreadLocalStream; it must not rebind the global.
+
+        This test asserted the exact opposite until 2026-08-28. The worker used to
+        rebind ``mlx_lm.generate.generation_stream`` to a fresh ``mx.new_stream()`` on
+        entry, and this pinned that as the contract. It was the defect: MLX registers a
+        ``new_stream()`` in the calling thread only, so publishing one into a
+        module-level global left every other thread unable to use it.
+
+        It was also one of the poisoners. It wrote a sentinel ``object()`` into that
+        global through a patched ``mx.new_stream`` and never put it back, which is part
+        of why five engine tests in *other* files failed whenever they ran after this
+        one and passed in isolation.
+
+        mlx-lm's own default there is an ``mx.ThreadLocalStream``, already correct from
+        every thread. The contract now is that nothing touches it.
+        """
         import importlib
+
+        import mlx.core as mx
 
         from vllm_mlx.engine.simple import SimpleEngine
 
         mlx_lm_generate = importlib.import_module("mlx_lm.generate")
-        sentinel_stream = object()
+        before = mlx_lm_generate.generation_stream
 
-        with (
-            patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
-            patch("vllm_mlx.mlx_streams.mx.default_device", return_value="gpu"),
-            patch(
-                "vllm_mlx.mlx_streams.mx.new_stream",
-                return_value=sentinel_stream,
-            ),
-            patch("vllm_mlx.mlx_streams.mx.set_default_stream"),
-        ):
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
             engine = SimpleEngine("test-model")
             observed = await engine._run_blocking_serialized(
                 lambda: mlx_lm_generate.generation_stream
             )
 
-        assert observed is sentinel_stream
+        assert isinstance(before, mx.ThreadLocalStream)
+        assert observed is before, "the worker saw a different generation stream"
+        assert mlx_lm_generate.generation_stream is before, (
+            "the shared generation stream was rebound and left rebound"
+        )
 
     @pytest.mark.anyio
     async def test_llm_stream_generate_stays_on_model_load_thread(self):
@@ -2082,7 +2093,6 @@ class TestSimpleEngineConcurrency:
         engine._draft_model = object()
 
         with (
-            patch("vllm_mlx.engine.simple._bind_worker_generation_streams"),
             patch(
                 "mlx_lm.models.cache.make_prompt_cache",
                 return_value=["backbone-cache"],

@@ -35,7 +35,6 @@ from .mllm_batch_generator import (
     MLLMBatchRequest,
     MLLMBatchResponse,
 )
-from .mlx_streams import bind_generation_streams
 from .multimodal_processor import MultimodalProcessor
 from .request import RequestOutput, RequestStatus, SamplingParams
 
@@ -927,14 +926,6 @@ class MLLMScheduler:
         each request.  This prevents long preprocessing (10-30+ s for 40K+
         token conversations) from blocking health checks and new connections.
         """
-        streams_bound = False
-
-        def _ensure_streams_bound() -> None:
-            nonlocal streams_bound
-            if not streams_bound:
-                bind_generation_streams()
-                streams_bound = True
-
         loop = asyncio.get_running_loop()
 
         # Reset on any successful pass; see the handler at the bottom of the loop.
@@ -982,7 +973,6 @@ class MLLMScheduler:
 
                 # --- Step phase ---
                 if self.has_requests():
-                    _ensure_streams_bound()
                     tic = time.perf_counter()
                     self.step()
                     elapsed = time.perf_counter() - tic

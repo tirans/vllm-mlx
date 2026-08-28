@@ -25,7 +25,6 @@ from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
-from .mlx_streams import bind_generation_streams  # single-threaded generate path
 
 logger = logging.getLogger(__name__)
 
@@ -143,16 +142,16 @@ class EngineCore:
         scheduler.step runs on one dedicated worker thread, always, and this loop
         deliberately does NOT bind MLX generation streams to that worker.
 
-        It used to. `bind_generation_streams()` creates a fresh `mx.new_stream()` --
-        which MLX registers in the *calling* thread -- and then publishes it into the
-        module-level `mlx_lm.generate.generation_stream` that every engine in the
-        process shares. So an engine arriving at its worker replaced a stream that
-        works everywhere with one that works only on that worker: measured, the main
-        thread afterwards cannot use `generation_stream` at all
-        (`There is no Stream(gpu, 1) in current thread`). With `--multi` that is one
-        engine reaching into another engine's in-flight generation. mlx-lm's own
-        default is a `ThreadLocalStream`, which is already correct for every thread;
-        overwriting it was strictly a downgrade.
+        It used to, through a `bind_generation_streams()` helper that has since been
+        deleted outright -- it created a fresh `mx.new_stream()`, which MLX registers in
+        the *calling* thread, and published it into the module-level
+        `mlx_lm.generate.generation_stream` that every engine in the process shares. So
+        an engine arriving at its worker replaced a stream that works everywhere with
+        one that works only on that worker: measured, the main thread afterwards cannot
+        use `generation_stream` at all (`There is no Stream(gpu, 1) in current thread`).
+        With `--multi` that is one engine reaching into another engine's in-flight
+        generation. mlx-lm's own default is a `ThreadLocalStream`, which is already
+        correct for every thread; overwriting it was strictly a downgrade.
 
         What actually made the worker safe is upstream of here: `Scheduler.__init__`
         materializes the model's arrays on the constructing thread
@@ -544,10 +543,12 @@ class EngineCore:
             self.scheduler.add_request(request)
             request_ids.append(request_id)
 
-        # Bind MLX generation streams to the calling thread so that
-        # scheduler.step() can evaluate KV cache state without hitting
-        # "There is no Stream(gpu, N) in current thread" errors.
-        bind_generation_streams()
+        # This used to bind MLX generation streams to the calling thread first.
+        # It does not need to: `Scheduler.__init__` already materialized the model's
+        # arrays on the thread that constructed it, and mlx-lm's own
+        # `generation_stream` is a `ThreadLocalStream` that is valid here. The bind
+        # only replaced that global with a stream affine to whichever thread called
+        # last, which is the process-wide pollution described in `mlx_streams`.
 
         # Process until all done - direct scheduler access, no async overhead
         results: Dict[str, RequestOutput] = {}

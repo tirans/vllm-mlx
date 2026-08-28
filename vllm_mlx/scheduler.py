@@ -2902,12 +2902,19 @@ class Scheduler:
                     # handler permanently disables). Once spent, every later
                     # mismatch lands here.
                     #
-                    # Rebind this thread's generation streams before resetting:
-                    # the batch generator's cached state references the stream
-                    # that just went away, so recovery has to re-establish
-                    # ownership first or the reset itself can fault.
+                    # This used to rebind the thread's generation streams first,
+                    # on the theory that the batch generator's cached state pointed
+                    # at a stream that had gone away. It no longer does, and the
+                    # rebind was the wrong remedy anyway: it published a stream
+                    # affine to THIS thread into the process-wide
+                    # `mlx_lm.generate.generation_stream`, so a fault recovered here
+                    # left every other engine and every other thread holding a
+                    # stream they cannot use -- the recovery manufacturing the next
+                    # fault. Nothing in the engine creates a disposable stream any
+                    # more, and mlx-lm's `ThreadLocalStream` default is valid from
+                    # this thread already. See `vllm_mlx/mlx_streams`.
                     #
-                    # Then DROP THE PREFIX CACHE. A cached entry is the only state
+                    # DROP THE PREFIX CACHE. A cached entry is the only state
                     # that survives the batch-generator reset, and a stale entry is
                     # what turns one stream fault into a loop: the 2026-08-27
                     # incident crashed on 10 consecutive cache HITs and 0 cold
@@ -2915,21 +2922,17 @@ class Scheduler:
                     # poison. Clearing costs one slow re-prefill and bounds any
                     # novel stream fault to a single request.
                     try:
-                        from .mlx_streams import bind_generation_streams
-
-                        bind_generation_streams()
                         cleared = self._clear_prefix_caches()
                         logger.warning(
-                            "[stream_thread] rebound generation streams, reset the "
-                            "batch generator and cleared %s prefix cache(s); "
-                            "failing in-flight requests so clients get a typed "
-                            "error instead of a stalled stream",
+                            "[stream_thread] reset the batch generator and cleared "
+                            "%s prefix cache(s); failing in-flight requests so "
+                            "clients get a typed error instead of a stalled stream",
                             cleared,
                         )
                     except Exception:
                         logger.warning(
-                            "[stream_thread] stream rebind or cache clear failed; "
-                            "resetting the batch generator anyway",
+                            "[stream_thread] prefix cache clear failed; resetting "
+                            "the batch generator anyway",
                             exc_info=True,
                         )
                 # Recover from fatal errors (OOM, Metal crash) instead of

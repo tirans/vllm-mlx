@@ -118,8 +118,13 @@
   `mlx_lm.load` leaves some module arrays lazy, and MLX >= 0.32 will not finish an op graph
   from another thread. `mx.eval(model.parameters())` is NOT enough — the offending arrays are
   non-parameter buffers (rope frequencies, masks); only `mx.eval(model.state)` reaches them.
-  `Scheduler.__init__` does this (`materialize_model_arrays`); any other path handing a model
-  across threads must too. This is what kept the #407 guard red from `ee8af4f` onward.
+  `Scheduler.__init__` does this (`materialize_model_arrays`), and so does
+  `SimpleEngine.prepare_for_start` — it loads on the event-loop thread but runs non-stream
+  chat inside an `asyncio.to_thread` worker. Any other path handing a model across threads
+  must too. This is what kept the #407 guard red from `ee8af4f` onward.
+  - The rejected alternative was `bind_generation_streams()`, deleted 2026-08-28. Rebinding
+    the shared `mlx_lm.generate.generation_stream` never fixed the crossing — it only moved
+    the breakage onto whichever thread had not bound last.
 - Prompts under ~2k tokens log `stored=False` — too small to enter the prefix cache.
 - Prefill is O(n^2): 8k->2.5s, 32k->19s, 64k->74s, 131k->~5min. `/v1/status` stops
   answering entirely during a large prefill.
@@ -138,12 +143,19 @@
 
 ## Testing
 
-- **The suite does not go green: `main` is 6 failed / 2376 passed, and the failures are
-  order-dependent** — every one passes in isolation. `tests/test_simple_engine.py` runs
-  `engine/simple.py`, which calls `bind_generation_streams()` and poisons the process-wide
-  `mlx_lm.generate.generation_stream` for every engine test after it. Before concluding your
-  change broke a test, `git stash push -- vllm_mlx tests` and re-run it: that is exactly the
-  check that would have saved a wasted revert on 2026-08-28.
+- **The suite goes green: 2383 passed / 0 failed, in forward and reverse file order.** It
+  did not until 2026-08-28 — `main` was 6 failed / 2376 passed with every failure passing in
+  isolation, because `bind_generation_streams()` poisoned the process-wide
+  `mlx_lm.generate.generation_stream` and whichever engine test ran after
+  `tests/test_simple_engine.py` inherited a stream it could not use. That function is gone.
+  A red test is now a real signal again, so treat one as your change until proven otherwise —
+  but confirm order-independence (`pytest -q $(ls -r tests/test_*.py)`) before blaming it on
+  ordering, and `git stash push -- vllm_mlx tests` before concluding it is pre-existing.
+- **Nothing may assign to `mlx_lm.generate.generation_stream`.** It is an
+  `mx.ThreadLocalStream`, already correct from every thread; overwriting it with an
+  `mx.new_stream()` binds it to one thread and breaks every other. Guarded two ways in
+  `tests/test_engine_core_thread_streams.py` — the live object's type, and a source scan of
+  `vllm_mlx/` that catches a reintroduction even from code the suite never executes.
 - **Format only the files you touched.** The repo is not format-clean, so `ruff format <dir>`
   reformats 50+ unrelated files straight into your diff. Use `ruff format path/to/one.py`.
 - **MLX threading probes must use persistent threads** (`ThreadPoolExecutor(max_workers=1)`),

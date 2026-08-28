@@ -104,10 +104,6 @@ class SimpleEngineCancelSerializationTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("vllm_mlx.engine.simple.is_mllm_model", return_value=True),
-            patch(
-                "vllm_mlx.engine.simple._bind_worker_generation_streams",
-                return_value=None,
-            ),
             patch.object(mlx_lm, "stream_generate", side_effect=fake_stream_generate),
         ):
             engine = SimpleEngine("test-model")

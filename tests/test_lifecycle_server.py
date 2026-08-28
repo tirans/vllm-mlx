@@ -765,6 +765,7 @@ class TestLifecycleFailureHandling:
             response_format=None,
             tools=[{"type": "function"}],
             tool_choice=None,
+            reasoning_effort=None,
             enable_thinking=None,
             video_fps=None,
             video_max_frames=None,
