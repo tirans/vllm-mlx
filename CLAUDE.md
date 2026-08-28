@@ -114,6 +114,12 @@
     an `engine_core` fallback that `ee8af4f` made unreachable (`step()` stopped re-raising),
     and it has since been deleted. If a doc names a log line as the symptom, grep the log for
     it before believing the doc.
+- **A model loaded on one thread and first *used* on another must be materialized first.**
+  `mlx_lm.load` leaves some module arrays lazy, and MLX >= 0.32 will not finish an op graph
+  from another thread. `mx.eval(model.parameters())` is NOT enough — the offending arrays are
+  non-parameter buffers (rope frequencies, masks); only `mx.eval(model.state)` reaches them.
+  `Scheduler.__init__` does this (`materialize_model_arrays`); any other path handing a model
+  across threads must too. This is what kept the #407 guard red from `ee8af4f` onward.
 - Prompts under ~2k tokens log `stored=False` — too small to enter the prefix cache.
 - Prefill is O(n^2): 8k->2.5s, 32k->19s, 64k->74s, 131k->~5min. `/v1/status` stops
   answering entirely during a large prefill.
@@ -129,6 +135,21 @@
   several seconds while models preload. A consumer with a short retry budget (e.g. one 2s
   connect retry) can fail outright mid-restart rather than recovering — avoid restarting
   while something else is actively calling the server.
+
+## Testing
+
+- **The suite does not go green: `main` is 6 failed / 2376 passed, and the failures are
+  order-dependent** — every one passes in isolation. `tests/test_simple_engine.py` runs
+  `engine/simple.py`, which calls `bind_generation_streams()` and poisons the process-wide
+  `mlx_lm.generate.generation_stream` for every engine test after it. Before concluding your
+  change broke a test, `git stash push -- vllm_mlx tests` and re-run it: that is exactly the
+  check that would have saved a wasted revert on 2026-08-28.
+- **Format only the files you touched.** The repo is not format-clean, so `ruff format <dir>`
+  reformats 50+ unrelated files straight into your diff. Use `ruff format path/to/one.py`.
+- **MLX threading probes must use persistent threads** (`ThreadPoolExecutor(max_workers=1)`),
+  never a bare `threading.Thread` per step — an exited thread takes its stream registry with
+  it, so ephemeral threads fail for a second, unrelated reason and make a broken fix look
+  tested.
 
 ## Benchmarking
 
