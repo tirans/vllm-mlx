@@ -59,6 +59,12 @@
   restart destroys the forensic window you will want ten minutes later.
 - To smoke-test `run.sh`/registry changes fast, use the `smoke-test-registry` skill
   (tiny cached models, serve→swap→evict in seconds).
+- For a logic-only change (a new bash function, a jq snippet) that needs no real model
+  load: extract just that function into a standalone temp script, or pipe the jq snippet
+  directly, and unit-test it there. Do not source or invoke `run.sh` itself for this —
+  bare invocation attempts an actual serve/bind against whatever port is configured, which
+  can hit the shared, possibly-in-use endpoint. `./run.sh --help` is the one safe
+  full-script smoke check (read-only, no bind).
 
 ## Reasoning effort
 
