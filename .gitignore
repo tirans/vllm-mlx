@@ -101,8 +101,8 @@ temp/
 .claude.local.md
 
 # Claude Code runtime state (a live session lock, not configuration)
-.claude/scheduled_tasks.lock
+**/.claude/scheduled_tasks.lock
 
 # machine-local Claude Code permissions — never shared project policy.
 # .claude/settings.json and .claude/skills/ ARE shareable and stay trackable.
-.claude/settings.local.json
+**/.claude/settings.local.json
