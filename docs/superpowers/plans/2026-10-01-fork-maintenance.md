@@ -16,9 +16,10 @@ GitHub Actions CI conventions. No new production dependency is required.
 
 **Spec:** [Updated design](../specs/2026-10-01-fork-maintenance-design.md).
 
-**Execution status (2026-10-01):** IN_PROGRESS. G1 through G4 are complete at
-integrated candidate `1036ca3`; P3A and P3B are complete. Hosted CI and
-publication remain pending. The schedule remains dependency-based.
+**Execution status (2026-10-01):** COMPLETE through G5. The tested runtime
+candidate is `1036ca3`; publication of `ac58df4` to `origin/main` was verified
+with `git ls-remote`. Hosted CI was queued/running at publication and its
+results remain pending. This completion covers implementation and local QA.
 
 ## Global constraints
 
@@ -61,7 +62,7 @@ evidence.
 | P3B | DevOps adds fork workflow and maintenance runbook | G2 | Workflow/doc commits, focused review and guard checks | COMPLETE; hosted CI NOT_RUN |
 | P4 | Reviewer reviews the finished integrated diff; Owner combines accepted commits | P3A/P3B | G3: no unresolved correctness or scope findings | COMPLETE at `1036ca3` |
 | P5 | QA validates frozen integrated candidate | G3 | G4: required regression and suite checks pass | COMPLETE at `1036ca3`; hosted CI NOT_RUN |
-| P6 | Owner refreshes remote state, scans outgoing changes and publishes | G4 | G5: final revision accepted and remote verified | PREPUBLICATION CHECKS; push pending |
+| P6 | Owner refreshes remote state, scans outgoing changes and publishes | G4 | G5: final revision accepted and remote verified | COMPLETE; remote `ac58df4` verified |
 
 ### Dated baseline and workflow evidence (2026-10-01)
 
@@ -114,7 +115,18 @@ The owner refreshed both remotes: `upstream/main` remains `f5d7e00` and
 found no credentials. A scan of all 458 tracked files found only two intentional
 synthetic localhost credential fixtures. Local `.env` variants are ignored and
 `.env.example` contains a placeholder. Publication and remote verification are
-still pending.
+recorded below.
+
+### Publication receipt (2026-10-01)
+
+A normal fast-forward and push published `ac58df4b07c07df1e96e2470c05d89f4977f3d42`
+to the fork. `git ls-remote origin refs/heads/main` returned that exact commit.
+Its production, test and workflow trees match the accepted `1036ca3`; only
+acceptance documentation was added. The final scan covered all eight outgoing
+commits with no credential-pattern matches. Existing CI run `36867949586` was
+running and fork regression run `36867949587` was queued when checked. Hosted
+results are not yet acceptance evidence. This receipt is a documentation-only
+follow-up to that verified publication.
 
 P1 can use Owner + Architect + DevOps + QA; DevOps host preflight must finish
 before QA starts resource-consuming checks. P3 uses Owner + Coder + DevOps.
@@ -432,11 +444,11 @@ to repository security settings.
 - [x] Review all outgoing commits and final content with redacted secret scanning;
   verify local `.env` variants are ignored and `.env.example` is placeholder-only.
   Pattern scans are partial evidence; manually resolve any findings.
-- [ ] Confirm the accepted candidate, inventory/runbook, and test evidence agree.
+- [x] Confirm the accepted candidate, inventory/runbook, and test evidence agree.
   Incorporate it into main with normal history, preserving unrelated local work.
-- [ ] Push only to the fork's origin/main using a normal push. A non-fast-forward
+- [x] Push only to the fork's origin/main using a normal push. A non-fast-forward
   rejection returns to integration; never force the update.
-- [ ] Verify remote main matches the delivered local commit and report working
+- [x] Verify remote main matches the delivered local commit and report working
   tree state, changes, evidence, and remaining limitations.
 
 **G5:** Published fork commit matches the accepted source and remote confirmation.

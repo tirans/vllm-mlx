@@ -64,7 +64,8 @@ These observations are a dated preflight, not a test or a future host guarantee.
 The repaired G2 baseline and G4 candidate counts, revisions and external log
 paths are recorded in the [plan](../superpowers/plans/2026-10-01-fork-maintenance.md).
 The policy extraction is integrated at `1036ca3`; targeted local QA and both
-full suite orders passed. Hosted CI and publication remain pending.
+full suite orders passed. Publication of `ac58df4` to the fork was verified;
+hosted CI results remain pending. See the plan for the publication receipt.
 
 ## Validation gates
 

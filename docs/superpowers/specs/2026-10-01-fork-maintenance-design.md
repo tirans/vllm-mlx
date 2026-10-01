@@ -1,7 +1,8 @@
 # Fork maintenance design
 
 Status (2026-10-01): implementation, independent review and local candidate
-validation complete at `1036ca3` (G4). Hosted CI and publication remain pending.
+validation complete at `1036ca3` (G4). Publication of `ac58df4` to the fork
+was verified (G5); hosted CI results remain pending.
 
 This replaces the five-extraction proposal previously stored at
 `/private/tmp/vllm-mlx-fork-merge-refactor-spec.md`. The implementation schedule is
@@ -81,7 +82,8 @@ reverse file order. The original design update ran no tests. The later repaired
 baseline passed G2 at `fc83413`, with its counts and logs in the companion
 plan. The integrated candidate at `1036ca3` passed independent review,
 targeted local fixture checks and both full suite orders. Counts, skips and
-evidence paths are in the plan. Hosted CI and publication remain pending.
+evidence paths and the verified publication receipt are in the plan. Hosted
+CI results remain pending.
 
 Linux dependency-light tests, fixture tests on Apple Silicon, and real-model
 checks must be reported separately. Existing CI enumerates tests explicitly and
