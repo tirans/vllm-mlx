@@ -16,9 +16,10 @@ GitHub Actions CI conventions. No new production dependency is required.
 
 **Spec:** [Updated design](../specs/2026-10-01-fork-maintenance-design.md).
 
-**Execution status:** PLAN_UPDATED. P1 is READY for execution; coding and tests
-are queued below, not running. The schedule is dependency-based, not a calendar
-automation or a promise that an unattended worker will start later.
+**Execution status (2026-10-01):** IN_PROGRESS. G1 and G2 are complete;
+P3A policy extraction is in progress, and P3B workflow/runbook preparation is
+complete. Final integrated review, candidate QA, hosted CI and publication are
+pending. The schedule remains dependency-based.
 
 ## Global constraints
 
@@ -39,8 +40,9 @@ automation or a promise that an unattended worker will start later.
 ## Roles and execution queue
 
 Models below are configured assignments from `~/.agents/role-workflows.md`.
-Only the architect has been dispatched during this plan update; each future
-dispatch must record its actual model, effort, checkout, and revision.
+At the original plan update, only the architect had been dispatched. Execution
+assignments use the model, effort, checkout and revision recorded with their
+evidence.
 
 | Role | Configured model / effort | Ownership |
 |---|---|---|
@@ -54,12 +56,36 @@ dispatch must record its actual model, effort, checkout, and revision.
 | Phase | Work and assigned roles | Dependency | Exit gate | Current status |
 |---|---|---|---|---|
 | P0 | Owner updates plan; Architect checks boundaries | Latest critical review | Revised scope and contracts written | COMPLETE |
-| P1 | Architect inventories deltas; DevOps checks environment; QA establishes baseline after preflight | P0 | G1: source/environment pinned, inventory, baseline result | READY |
-| P2 | Coder repairs baseline failures or removes proven redundant delta; Reviewer and QA check each commit | P1 findings | G2: stable baseline; necessary fork changes retained | CONDITIONAL, WAITING |
-| P3 | Coder implements effort policy; DevOps prepares additive workflow/runbook in separate worktree | G1/G2 | Focused commits and targeted results | QUEUED |
-| P4 | Reviewer reviews both finished diffs; Owner combines accepted commits | P3 | G3: no unresolved correctness or scope findings | QUEUED |
-| P5 | QA validates frozen integrated candidate | G3 | G4: required regression and suite checks pass | QUEUED |
-| P6 | Owner refreshes remote state, scans outgoing changes and publishes | G4 | G5: final revision accepted and remote verified | QUEUED |
+| P1 | Architect inventories deltas; DevOps checks environment; QA establishes baseline after preflight | P0 | G1: source/environment pinned, inventory, baseline result | COMPLETE |
+| P2 | Coder repairs baseline failures or removes proven redundant delta; Reviewer and QA check each commit | P1 findings | G2: stable baseline; necessary fork changes retained | COMPLETE |
+| P3A | Coder extracts effort policy and adds characterization tests | G2 | Focused commit and targeted results | IN_PROGRESS |
+| P3B | DevOps adds fork workflow and maintenance runbook | G2 | Workflow/doc commits, focused review and guard checks | COMPLETE; hosted CI NOT_RUN |
+| P4 | Reviewer reviews the finished integrated diff; Owner combines accepted commits | P3A/P3B | G3: no unresolved correctness or scope findings | PENDING |
+| P5 | QA validates frozen integrated candidate | G3 | G4: required regression and suite checks pass | PENDING |
+| P6 | Owner refreshes remote state, scans outgoing changes and publishes | G4 | G5: final revision accepted and remote verified | PENDING |
+
+### Dated baseline and workflow evidence (2026-10-01)
+
+The original focused baseline had **291 passed, 15 failed**; its first-failure
+evidence remains outside Git in
+`/private/tmp/vllm-mlx-maintenance-baseline/focused-elevated.log`. The bounded
+test-isolation/fixture repair at `fc83413` passed the focused gate with **422
+passed, 4 deselected** in 6.75 seconds. Across 149 test files, the full suite
+passed in forward order (**3587 passed, 24 skipped, 27 deselected**, 42.99 seconds)
+and reverse order (same counts, 41.65 seconds). Logs are
+`focused-repair2.log`, `forward-repair2.log` and `reverse-repair2.log` in that
+same external directory. Skipped and deselected contracts are not live-model
+acceptance. The reviewed repair was integrated at `4ce111c`; its `vllm_mlx/`
+and `tests/` trees are identical to `fc83413`. No fork implementation was
+removed as redundant.
+
+The P3B workflow/runbook commits are `196b76d` and `ab14fc1`. A local check
+of the workflow's extracted Linux guard returned exit codes 0 for a passing
+test, 1 for pass plus skip, 5 for collection skip, 5 for zero collection, and
+1 for a failing test. This validates the guard logic locally; hosted Linux and
+Apple Silicon jobs remain **NOT_RUN** until their actual CI results exist.
+These baseline results precede the P3A policy extraction and do not establish
+G4 acceptance for its integrated candidate.
 
 P1 can use Owner + Architect + DevOps + QA; DevOps host preflight must finish
 before QA starts resource-consuming checks. P3 uses Owner + Coder + DevOps.
@@ -309,9 +335,11 @@ tests, or upstream `.github/workflows/ci.yml`. Consume the agreed new
 - [ ] Linux job: Python 3.10 and 3.13, install pytest, run only the dependency-light
   `tests/test_effort_policy.py`. Fail on accidental server/MLX import dependencies.
 - [ ] Apple Silicon job: use existing project installation conventions and verify
-  actual arm64/MLX availability before running the explicit fork regression files
-  listed in P1. Keep stub-based Linux tests in a separate process from real MLX.
-  Missing architecture/dependencies must fail visibly, not silently skip the job.
+  actual arm64/MLX availability before running the fork fixture files from P1.
+  Keep the model-loading `test_engine_core_stream_safety.py` in the separate
+  cached-model gate. Keep stub-based Linux tests in a separate process from real
+  MLX. Missing architecture/dependencies must fail visibly, not silently skip
+  the job.
 - [ ] Add the new policy tests to the Apple job as well, so both jobs bind to the
   integrated implementation. Preserve logs and counts for skipped/deselected tests.
 - [ ] Document fixture checks separately from full local suite-order validation

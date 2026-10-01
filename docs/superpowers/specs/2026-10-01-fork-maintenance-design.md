@@ -1,6 +1,7 @@
 # Fork maintenance design
 
-Status: updated design; implementation and test execution are scheduled, not started.
+Status (2026-10-01): implementation in progress. The repaired baseline passed
+G2; policy extraction and final integrated validation remain pending.
 
 This replaces the five-extraction proposal previously stored at
 `/private/tmp/vllm-mlx-fork-merge-refactor-spec.md`. The implementation schedule is
@@ -21,8 +22,9 @@ No claim of conflict-free future merges is an acceptance criterion.
   commits at the last fetch; the net difference touches 53 files.
 - `origin` points to `tirans/vllm-mlx`; `upstream` points to
   `waybarrios/vllm-mlx`. Local main tracks origin/main.
-- The last merge had 15 conflicted paths and received static checks and source
-  review. Runtime baseline acceptance remains NOT_RUN.
+- At the original design update, the last merge had 15 conflicted paths and
+  received static checks and source review. Runtime baseline acceptance was
+  NOT_RUN at that snapshot; the later G2 evidence is recorded in the plan.
 - Local `rerere.enabled` is true; `rerere.autoupdate` was unset when inspected.
   DevOps will explicitly set autoupdate false for the integration checkout.
 
@@ -73,10 +75,11 @@ identities before using them as evidence.
 
 ## Validation and operational boundaries
 
-The user has requested coding and tests to be scheduled with roles. The schedule
-includes meaningful characterization checks, existing API regression tests, and
-the repository-required full suite in forward and reverse file order. Test
-execution is queued for the execution phase; this design update runs no tests.
+The role-based execution includes meaningful characterization checks, existing
+API regression tests, and the repository-required full suite in forward and
+reverse file order. The original design update ran no tests. The later repaired
+baseline passed G2 at `fc83413`, with its counts and logs in the companion
+plan; final candidate QA and hosted CI remain pending.
 
 Linux dependency-light tests, fixture tests on Apple Silicon, and real-model
 checks must be reported separately. Existing CI enumerates tests explicitly and

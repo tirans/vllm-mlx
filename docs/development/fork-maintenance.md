@@ -45,7 +45,7 @@ reviewing each merged change semantically.
    ```
 
    Inspect `git status`, every conflict and `git diff --cc`; a reused rerere
-   resolution still needs human review before `git add`. Keep normal commit
+   resolution still needs source review before `git add`. Keep normal commit
    history. Never force push or use a blanket conflict-resolution driver.
 4. Before implementation or validation, identify the interpreter and verify
    `PYTHONPATH="$PWD"` resolves `vllm_mlx.__file__` inside the integration
@@ -61,6 +61,9 @@ MLX-VLM 0.6.13. `PYTHONPATH="$PWD"` resolved to that worktree. `lsof`
 found no TCP port-8000 listener; `vm_stat` succeeded. This sandbox denied
 `sysctl hw.memsize`/`vm.swapusage`, and the shared venv had no `pip` module.
 These observations are a dated preflight, not a test or a future host guarantee.
+The repaired G2 baseline counts, revision and external log paths are recorded
+in the [plan](../superpowers/plans/2026-10-01-fork-maintenance.md). They precede
+the policy extraction; integrated candidate QA and hosted CI remain pending.
 
 ## Validation gates
 
