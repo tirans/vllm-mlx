@@ -17,7 +17,7 @@ textual merge does not establish behavioral compatibility.
 | Worker and cache affinity: `vllm_mlx/mlx_streams.py`, `vllm_mlx/memory_cache.py`, `vllm_mlx/mllm_batch_generator.py`, engine files | Persistent worker streams, cross-thread model materialization and prefix-cache hit safety; `test_engine_core_thread_streams.py`, `test_engine_core_stream_safety.py`, `test_memory_cache_thread_affinity.py` | General correctness fix. Retain. Upstream worker behavior overlaps, but the merged MLX 0.32 contract has no proven redundant fork patch. |
 | Scheduler recovery and MTP: `vllm_mlx/scheduler.py`, `vllm_mlx/mllm_scheduler.py` | Orphan/stall recovery, cache clearing, per-request sampling and rollback; `test_scheduler_resilience.py`, `test_mllm_scheduler_resilience.py` | General correctness fix. Retain in the scheduler's ownership boundary. |
 | Stream errors: `vllm_mlx/server.py`, `vllm_mlx/engine/base.py` | Busy responses, SSE terminal/error signaling and disconnect cleanup; `test_server_engine_busy.py`, `test_responses_api.py`, `test_server.py` | General correctness fix. Retain the upstream-owned stream helper in place; moving it would create a second merge surface without proven benefit. |
-| API key fallback: `vllm_mlx/cli.py`, `.gitignore`, `.env.example` | Explicit `--api-key` takes precedence over `VLLM_MLX_API_KEY`; ignored local `.env` variants, placeholder-only example | Fork policy/security. Retain. An explicit precedence regression test remains to be added; `test_cli.py` currently covers neighboring CLI behavior. |
+| API key fallback: `vllm_mlx/cli.py`, `.gitignore`, `.env.example` | Explicit `--api-key` takes precedence over `VLLM_MLX_API_KEY`; ignored local `.env` variants, placeholder-only example | Fork policy/security. Retain. Followup `82fd70a` adds explicit CLI-over-environment cases to `test_cli.py`; QA validation and integration remain pending. |
 | Launcher and guidance: `run.sh`, `scripts/setup.sh`, `models.json`, `AGENTS.md`, `.claude/skills/`, fork docs | Catalog serving, safe smoke/benchmark/incident procedures and corrected documentation | Fork tooling/docs. Retain; documentation corrections do not imply source equivalence. |
 
 No upstream-equivalent fork implementation has been demonstrated removable by
@@ -65,8 +65,9 @@ These observations are a dated preflight, not a test or a future host guarantee.
 ## Validation gates
 
 The additive [fork workflow](../../.github/workflows/fork-regressions.yml)
-runs the pure `test_effort_policy.py` on Linux 3.10/3.13 with only pytest and
-checks that it did not import server/MLX modules. Its separate Apple Silicon
+runs the pure `test_effort_policy.py` on Linux 3.10/3.13 with only pytest,
+requires collected tests with no skips, and checks that they did not import
+server/MLX modules. Its separate Apple Silicon
 3.11/3.13 job installs the existing `[dev,vision,harmony]` extras, verifies
 arm64 and MLX 0.32 stream support, then runs the explicit fork fixture files
 with `-ra`, offline Hugging Face/Transformers settings, and a failure on any

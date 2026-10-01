@@ -37,9 +37,25 @@ jobs:
 
           import pytest
 
+          class RequiredPolicyTests:
+              collected = 0
+              skipped = []
+
+              def pytest_collection_finish(self, session):
+                  self.collected = len(session.items)
+
+              def pytest_collectreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+
+              def pytest_runtest_logreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+
+          gate = RequiredPolicyTests()
           result = pytest.main([
               "-q", "-ra", "--tb=short", "tests/test_effort_policy.py",
-          ])
+          ], plugins=[gate])
           forbidden = sorted(
               name for name in sys.modules
               if name == "vllm_mlx.server"
@@ -51,7 +67,11 @@ jobs:
           )
           if forbidden:
               print(f"Pure policy tests imported runtime modules: {forbidden}")
-          raise SystemExit(int(result) or bool(forbidden))
+          if not gate.collected:
+              print("No policy tests were collected")
+          if gate.skipped:
+              print(f"Required policy tests skipped: {gate.skipped}")
+          raise SystemExit(int(result) or bool(forbidden) or not gate.collected or bool(gate.skipped))
           PY
 
   fork-fixtures-apple-silicon:
