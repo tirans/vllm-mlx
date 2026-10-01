@@ -198,6 +198,36 @@ class TestArrayMemory:
         expected = 2 * (1 * 8 * 100 * 64 * 2)
         assert estimate_kv_cache_memory([layer]) == expected
 
+    def test_estimate_handles_nested_cachelist_state(self):
+        """Regression: DeepSeek-V4's CacheList.state nests three sub-states.
+
+        The old two-way unpack raised ValueError, was swallowed, and the whole
+        entry counted as 0 bytes — so the dashboard's Prefix Cache bar stayed
+        at 0% and byte-based LRU eviction never fired for such models.
+        """
+
+        class NestedStateCache:
+            def __init__(self):
+                rot = (
+                    MockShapeArray(shape=(1, 8, 128, 64), dtype_size=2),
+                    MockShapeArray(shape=(1, 8, 128, 64), dtype_size=2),
+                )
+                pool_a = (
+                    MockShapeArray(shape=(1, 3, 512), dtype_size=2),
+                    MockShapeArray(shape=(1, 3, 128), dtype_size=2),
+                    MockShapeArray(shape=(1, 40, 512), dtype_size=2),
+                )
+                pool_b = (None, None, None)  # empty PoolingCache members
+                self.state = [rot, pool_a, pool_b]
+
+        expected = (
+            2 * (1 * 8 * 128 * 64 * 2)
+            + (1 * 3 * 512 * 2)
+            + (1 * 3 * 128 * 2)
+            + (1 * 40 * 512 * 2)
+        )
+        assert estimate_kv_cache_memory([NestedStateCache()]) == expected
+
 
 class TestEstimateKvCacheMemory:
     """Tests for estimate_kv_cache_memory function."""
@@ -278,7 +308,12 @@ class TestMemoryAwarePrefixCache:
 
         # Fetch exact match
         result, remaining = small_cache.fetch(tokens)
-        assert result is kv  # Same reference, no copy
+        # store() snapshots layer containers so stored entries never alias
+        # live caches; the underlying arrays are shared (or detached copies
+        # for real MLX arrays).
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
         assert remaining == []
 
     def test_short_prefix_reuse_is_rejected(self, model, mock_kv_cache):
@@ -311,8 +346,56 @@ class TestMemoryAwarePrefixCache:
         long_tokens = [1, 2, 3, 4, 5, 6]
         result, remaining = small_cache.fetch(long_tokens)
 
-        assert result is kv
+        assert result is not kv  # snapshot, not alias
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
         assert remaining == [4, 5, 6]
+
+    def test_fetch_retains_the_actual_supersequence_key(
+        self, small_cache, mock_kv_cache, monkeypatch
+    ):
+        stored_tokens = [1, 2, 3, 4]
+        kv = mock_kv_cache(1000)
+        small_cache.store(stored_tokens, kv)
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._trim_cache_offset",
+            lambda cache, _trim_by: cache,
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._is_cache_layer_trimmable",
+            lambda _layer: True,
+        )
+
+        result, remaining = small_cache.fetch([1, 2, 3])
+
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
+        assert remaining == []
+        assert small_cache._last_matched_key == tuple(stored_tokens)
+
+    def test_fetch_retains_the_actual_lcp_key(
+        self, small_cache, mock_kv_cache, monkeypatch
+    ):
+        stored_tokens = [1, 2, 3, 9]
+        kv = mock_kv_cache(1000)
+        small_cache.store(stored_tokens, kv)
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._trim_cache_offset",
+            lambda cache, _trim_by: cache,
+        )
+        monkeypatch.setattr(
+            "vllm_mlx.memory_cache._is_cache_layer_trimmable",
+            lambda _layer: True,
+        )
+
+        result, remaining = small_cache.fetch([1, 2, 3, 8])
+
+        assert result is not kv
+        assert result[0].keys is kv[0].keys
+        assert result[0].values is kv[0].values
+        assert remaining == [8]
+        assert small_cache._last_matched_key == tuple(stored_tokens)
 
     def test_fetch_miss(self, small_cache, mock_kv_cache):
         tokens = [1, 2, 3]
@@ -390,6 +473,31 @@ class TestMemoryAwarePrefixCache:
         assert small_cache.remove(tokens) is True
         assert len(small_cache) == 0
         assert small_cache.remove(tokens) is False  # Already removed
+
+    def test_remove_can_evict_the_same_key_from_ssd(self, small_cache, mock_kv_cache):
+        tokens = [1, 2, 3]
+        ssd_tier = MagicMock()
+        ssd_tier.remove.return_value = True
+        small_cache.set_ssd_tier(ssd_tier)
+        small_cache.store(tokens, mock_kv_cache(1000))
+
+        assert small_cache.remove(tokens, include_ssd=True) is True
+        assert tokens not in small_cache
+        ssd_tier.remove.assert_called_once_with(tuple(tokens))
+
+    def test_ssd_prefix_candidate_includes_the_actual_key(self, small_cache):
+        ssd_tier = MagicMock()
+        ssd_tier.lookup_ssd.return_value = None
+        ssd_tier.lookup_ssd_prefix.return_value = {
+            "num_tokens": 3,
+            "memory_bytes": 128,
+            "file_path": "entry",
+        }
+        small_cache.set_ssd_tier(ssd_tier)
+
+        candidate = small_cache.check_ssd([1, 2, 3, 4, 5])
+
+        assert candidate["matched_key"] == (1, 2, 3)
 
     def test_clear(self, small_cache, mock_kv_cache):
         for i in range(3):
@@ -525,3 +633,24 @@ class TestGetAvailableMemory:
             # Should return 0 when psutil not available
             # Note: This test may not work as expected due to import caching
             pass
+
+
+def test_load_rejects_v3_cache_after_rewind_semantics_change(tmp_path, caplog):
+    """Caches written before safe MLLM rewind must not survive an upgrade."""
+    import json
+
+    (tmp_path / "index.json").write_text(
+        json.dumps({"version": 3, "model_fingerprint": "", "entries": []})
+    )
+    cache = MemoryAwarePrefixCache(MagicMock(), MemoryCacheConfig(max_memory_mb=1))
+
+    with patch.dict(
+        "sys.modules",
+        {
+            "mlx_lm": None,
+            "mlx_lm.models": None,
+            "mlx_lm.models.cache": None,
+        },
+    ):
+        assert cache.load_from_disk(str(tmp_path)) == 0
+    assert "version mismatch: disk=3 current=4" in caplog.text

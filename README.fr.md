@@ -5,7 +5,7 @@
 **Continuous batching + API OpenAI et Anthropic dans un seul serveur. Inférence native sur Apple Silicon.**
 
 [![PyPI version](https://img.shields.io/pypi/v/vllm-mlx.svg)](https://pypi.org/project/vllm-mlx/)
-[![PyPI Downloads](https://img.shields.io/pypi/dm/vllm-mlx.svg)](https://pypi.org/project/vllm-mlx/)
+[![PyPI Downloads](https://static.pepy.tech/badge/vllm-mlx)](https://pepy.tech/projects/vllm-mlx)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Apple Silicon](https://img.shields.io/badge/Apple-Silicon-black.svg)](https://support.apple.com/en-us/HT211814)
@@ -46,7 +46,7 @@ claude
 ### APIs
 - **Compatible OpenAI** : `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/responses`
 - **Compatible Anthropic** : `/v1/messages` (streaming, tool use, system prompts)
-- **MCP Tool Calling** : 12 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma et plus)
+- **MCP Tool Calling** : 19 parsers (OpenAI, Anthropic, Gemini, Qwen, DeepSeek, Gemma et plus)
 - **Sortie structurée** : JSON Schema via `response_format` (lm-format-enforcer)
 
 ### Débit et mémoire
@@ -64,12 +64,12 @@ claude
 - **STT** : famille Whisper avec RTF jusqu'à 197x sur M4 Max
 
 ### Raisonnement et avancé
-- **Extraction du raisonnement** : Qwen3, DeepSeek-R1 (`--reasoning-parser`)
-- **Décodage spéculatif** : `--enable-mtp` pour Qwen3-Next
-- **Prefill creux** : `--specprefill` basé sur l'attention pour réduire le TTFT
+- **Extraction du raisonnement** : Qwen3, DeepSeek-R1, DeepSeek-V4 (`--reasoning-parser`)
+- **Décodage spéculatif** : `--enable-mtp` pour les modèles compatibles
+- **Prefill creux** : `--specprefill` basé sur l'attention pour les combinaisons de modèle et de brouillon compatibles
 
 ### Observabilité
-- **Métriques Prometheus** : endpoint `/metrics` avec `--metrics`
+- **Métriques Prometheus** : endpoint `/metrics` avec `--enable-metrics`
 - **Benchmark intégré** : `vllm-mlx bench-serve` pour des balayages de prompts en CSV/JSON
 
 ### Accélération GPU native
@@ -198,7 +198,7 @@ vllm-mlx bench-serve --url http://localhost:8000 --concurrency 5 --prompts promp
 ### Métriques Prometheus
 
 ```bash
-vllm-mlx serve <model> --metrics
+vllm-mlx serve <model> --enable-metrics
 curl http://localhost:8000/metrics
 ```
 
@@ -300,7 +300,7 @@ Apache 2.0. Voir [LICENSE](LICENSE).
 
 ## Historique des stars
 
-[![Star History Chart](https://api.star-history.com/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.com/#waybarrios/vllm-mlx&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=waybarrios/vllm-mlx&type=Date)](https://star-history.dera.page/#waybarrios/vllm-mlx&Date)
 
 ---
 

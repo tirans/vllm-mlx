@@ -247,7 +247,9 @@ def _build_ordered_mllm_message_content(
             video_frame_count=remaining_video_frames,
         )
 
-    if role == "assistant":
+    # Text-only assistant turns stay strings for template compatibility, but
+    # image turns must retain their placeholders alongside the image payloads.
+    if role == "assistant" and not any(part["type"] == "image" for part in built_parts):
         text = "".join(text_parts)
         return text, bool(text)
 
@@ -337,6 +339,139 @@ class MLLMOutput:
     mtp_accepted: int = 0
 
 
+def _chunk_text(chunk) -> str:
+    return chunk.text if hasattr(chunk, "text") else str(chunk)
+
+
+def _generation_kwargs_with_stop(
+    kwargs: dict,
+    stop: list[str] | None,
+) -> dict:
+    if not stop:
+        return kwargs
+    generation_kwargs = dict(kwargs)
+    generation_kwargs["stop"] = stop
+    return generation_kwargs
+
+
+def _until_stop_sequence(chunks, stop: list[str] | None):
+    if not stop:
+        yield from chunks
+        return
+
+    accumulated_text = ""
+    for chunk in chunks:
+        accumulated_text += _chunk_text(chunk)
+        yield chunk
+        if any(stop_seq in accumulated_text for stop_seq in stop):
+            break
+
+
+def _stream_mllm_generated_outputs(
+    *,
+    stream_generate_fn,
+    model,
+    processor,
+    formatted_prompt: str,
+    images,
+    audio,
+    max_tokens: int,
+    temperature: float,
+    prompt_cache,
+    draft_kwargs: dict,
+    generation_kwargs: dict,
+    stop: list[str] | None,
+    draft_metrics,
+):
+    token_count = 0
+    last_chunk = None
+    chunks = stream_generate_fn(
+        model,
+        processor,
+        formatted_prompt,
+        images,
+        audio=audio,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        prompt_cache=prompt_cache,
+        **draft_kwargs,
+        **generation_kwargs,
+    )
+    for chunk in _until_stop_sequence(chunks, stop):
+        last_chunk = chunk
+        token_count += 1
+        yield MLLMOutput(
+            text=_chunk_text(chunk),
+            finish_reason=None,
+            prompt_tokens=getattr(chunk, "prompt_tokens", 0),
+            completion_tokens=token_count,
+        )
+
+    yield MLLMOutput(
+        text="",
+        finish_reason="stop",
+        prompt_tokens=getattr(last_chunk, "prompt_tokens", 0) if last_chunk else 0,
+        completion_tokens=token_count,
+        **draft_metrics(),
+    )
+
+
+def load_assistant_drafter(model_path: str):
+    """Load an mlx-vlm assistant/MTP drafter for speculative decoding.
+
+    Dispatches by the drafter checkpoint's own ``config.json`` ``model_type``
+    (via ``mlx_vlm.utils.load_model``, the same generic loader mlx-vlm uses
+    for its own regular models) instead of assuming a single fixed
+    architecture. This covers the MTP drafter families mlx-vlm ships under
+    ``mlx_vlm.speculative.drafters`` (``gemma4_assistant``, ``qwen3_5_mtp``,
+    ``deepseek_v4_mtp``, ...) with one code path. Other speculative modes such
+    as Eagle3 and DFlash require generation paths vllm-mlx does not expose yet.
+
+    Deliberately uses ``load_model`` rather than ``mlx_vlm.utils.load``:
+    standalone assistant/MTP drafters are small predictor heads, not
+    full checkpoints, and typically don't ship their own tokenizer/processor
+    files (they reuse the target model's) — ``load`` would additionally try
+    to load a processor and fail or misbehave for such a checkpoint.
+    """
+    path = Path(model_path)
+    config_path = path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Assistant drafter config not found: {config_path}")
+    if not sorted(path.glob("*.safetensors")):
+        raise FileNotFoundError(f"Assistant drafter weights not found: {path}")
+
+    try:
+        from mlx_vlm.speculative.drafters import resolve_drafter_kind
+        from mlx_vlm.utils import load_model
+    except ImportError as exc:
+        raise ImportError(
+            "Assistant/MTP drafter support requires mlx-vlm to be installed."
+        ) from exc
+
+    try:
+        mlx_vlm_version = version("mlx-vlm")
+    except PackageNotFoundError:
+        mlx_vlm_version = "unknown"
+
+    model_type = json.loads(config_path.read_text(encoding="utf-8")).get("model_type")
+    resolved_kind = resolve_drafter_kind(path)
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Assistant drafter model_type={model_type!r} requires draft kind "
+            f"{resolved_kind!r}; vllm-mlx currently supports only 'mtp'."
+        )
+    logger.info(
+        "Loading %s assistant drafter from %s using mlx-vlm %s",
+        model_type or "unknown-architecture",
+        model_path,
+        mlx_vlm_version,
+    )
+
+    model = load_model(path)
+    model.eval()
+    return model
+
+
 def load_gemma4_assistant_drafter(model_path: str):
     """Load a Gemma 4 assistant drafter for mlx-vlm speculative decoding."""
     try:
@@ -378,6 +513,128 @@ def load_gemma4_assistant_drafter(model_path: str):
     model.load_weights(list(weights.items()))
     mx.eval(model.parameters())
     model.eval()
+    return model
+
+
+class MTPDrafterLoadError(RuntimeError):
+    """Raised when a registered MTP drafter architecture is unavailable."""
+
+
+_GEMMA4_ASSISTANT_MODEL_TYPES = {
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+}
+
+
+def _read_mtp_drafter_model_type(config_path: Path) -> str:
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid MTP drafter config JSON: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"MTP drafter config must be a JSON object: {config_path}")
+
+    candidates = [config.get("model_type"), config.get("speculators_model_type")]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict):
+        candidates.append(text_config.get("model_type"))
+
+    model_types = [
+        value.strip().casefold()
+        for value in candidates
+        if isinstance(value, str) and value.strip()
+    ]
+    drafter_types = {
+        model_type
+        for model_type in model_types
+        if model_type.endswith("_mtp") or model_type in _GEMMA4_ASSISTANT_MODEL_TYPES
+    }
+    if len(drafter_types) > 1:
+        raise ValueError(
+            f"MTP drafter config has conflicting model types: {config_path}"
+        )
+    if drafter_types:
+        return drafter_types.pop()
+    if model_types:
+        return model_types[0]
+    raise ValueError(f"MTP drafter config has no valid model_type: {config_path}")
+
+
+def _resolve_mtp_drafter_path(path_or_repo: str) -> Path:
+    path = Path(path_or_repo)
+    if path.exists():
+        return path
+    try:
+        from mlx_vlm.utils import get_model_path
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "Resolving an MTP drafter repository requires mlx-vlm"
+        ) from exc
+    return Path(get_model_path(path_or_repo))
+
+
+def load_mtp_drafter(model_path: str, target_model=None):
+    """Load a local or Hugging Face MTP drafter without assuming Gemma layout."""
+    resolved_path = _resolve_mtp_drafter_path(model_path)
+    config_path = resolved_path / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"MTP drafter config not found: {config_path}")
+    model_type = _read_mtp_drafter_model_type(config_path)
+    if model_type in _GEMMA4_ASSISTANT_MODEL_TYPES:
+        model = load_gemma4_assistant_drafter(str(resolved_path))
+        if target_model is not None:
+            try:
+                from mlx_vlm.speculative.drafters import (
+                    validate_drafter_compatibility,
+                )
+            except ImportError:
+                # Preserve compatibility with mlx-vlm releases that predate
+                # the shared validator; this is the existing Gemma loader.
+                pass
+            else:
+                validate_drafter_compatibility(target_model, model, "mtp")
+        return model
+
+    try:
+        from mlx_vlm.speculative.drafters import load_drafter
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+
+    logger.info(
+        "Loading registered MTP drafter model_type=%s from %s",
+        model_type,
+        resolved_path,
+    )
+    try:
+        loaded = load_drafter(str(resolved_path), kind="mtp", lazy=False)
+    except ImportError as exc:
+        raise MTPDrafterLoadError(
+            "This MTP drafter requires an mlx-vlm build with the registered "
+            f"{model_type!r} architecture."
+        ) from exc
+    if not isinstance(loaded, tuple) or len(loaded) != 2:
+        raise ValueError("mlx-vlm load_drafter() must return (model, resolved_kind)")
+    model, resolved_kind = loaded
+    if model is None:
+        raise ValueError("mlx-vlm load_drafter() returned no model")
+    if resolved_kind != "mtp":
+        raise ValueError(
+            f"Configured MTP drafter resolved to unsupported kind {resolved_kind!r}"
+        )
+    if target_model is not None:
+        try:
+            from mlx_vlm.speculative.drafters import (
+                validate_drafter_compatibility,
+            )
+        except ImportError as exc:
+            raise MTPDrafterLoadError(
+                "This MTP drafter requires an mlx-vlm build with the registered "
+                f"{model_type!r} architecture."
+            ) from exc
+        validate_drafter_compatibility(target_model, model, resolved_kind)
     return model
 
 
@@ -680,7 +937,9 @@ def _download_media(
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     }
 
-    logger.info(f"Downloading {media_type} from: {url}")
+    # URLs may contain credentials or signed query parameters. Keep request
+    # targets out of normal logs while retaining useful operation context.
+    logger.info("Downloading remote %s", media_type)
 
     try:
         head_response = _request_with_safe_redirects(
@@ -1242,6 +1501,7 @@ class MLXMultimodalLM:
         draft_model: str | None = None,
         draft_kind: str | None = None,
         draft_block_size: int | None = None,
+        default_draft_enabled: bool = False,
     ):
         """
         Initialize the MLX multimodal language model.
@@ -1263,6 +1523,7 @@ class MLXMultimodalLM:
         self.draft_model_path = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
+        self.default_draft_enabled = default_draft_enabled
 
         self.model = None
         self.processor = None
@@ -1324,7 +1585,7 @@ class MLXMultimodalLM:
 
     def _load_draft_model(self):
         if self.draft_kind == "mtp":
-            return load_gemma4_assistant_drafter(self.draft_model_path)
+            return load_mtp_drafter(self.draft_model_path, target_model=self.model)
 
         from mlx_vlm.utils import load
 
@@ -1332,15 +1593,15 @@ class MLXMultimodalLM:
         return draft_model
 
     def _draft_generation_kwargs(self, call_kwargs: dict | None = None) -> dict:
-        """Return mlx-vlm drafter kwargs when the request explicitly opts in.
+        """Return mlx-vlm drafter kwargs when the request enables the drafter.
 
         ``call_kwargs`` is the outbound mlx-vlm kwargs dict. This method removes
         vllm-mlx drafter control keys before the dict is forwarded so caller
         passthrough values cannot conflict with the configured server drafter.
         """
-        draft_requested = False
+        draft_requested = self.default_draft_enabled
         if call_kwargs is not None:
-            draft_requested = bool(call_kwargs.pop("mllm_draft", False))
+            draft_requested = bool(call_kwargs.pop("mllm_draft", draft_requested))
             for key in _DRAFT_KWARG_NAMES:
                 call_kwargs.pop(key, None)
         if not draft_requested or self._draft_model is None:
@@ -1404,25 +1665,11 @@ class MLXMultimodalLM:
 
     def _prepare_images(self, images: list) -> list[str]:
         """Process remote/base64 image inputs into local temp file paths."""
-        processed = []
-        for img in images:
-            try:
-                path = process_image_input(img)
-                processed.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to process image: {e}")
-        return processed
+        return [process_image_input(image) for image in images]
 
     def _prepare_audio(self, audio_inputs: list) -> list[str]:
         """Process audio inputs and return local file paths."""
-        processed = []
-        for audio_input in audio_inputs:
-            try:
-                path = process_audio_input(audio_input)
-                processed.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to process audio: {e}")
-        return processed
+        return [process_audio_input(audio_input) for audio_input in audio_inputs]
 
     def _prepare_video(
         self,
@@ -1962,7 +2209,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             top_p=top_p,
             verbose=False,
             prompt_cache=prompt_cache,
@@ -2086,7 +2333,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             **self._draft_generation_kwargs(kwargs),
             **kwargs,
         ):
@@ -2393,7 +2640,7 @@ class MLXMultimodalLM:
             all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             verbose=False,
             prompt_cache=prompt_cache,
             skip_prompt_processing=skip_prompt_processing,
@@ -2536,6 +2783,7 @@ class MLXMultimodalLM:
         video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
         video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
         tools = kwargs.pop("tools", None)
+        stop = kwargs.pop("stop", None)
         use_cache = kwargs.pop("use_cache", True)
         enable_thinking = kwargs.pop("enable_thinking", True)
         # Honor chat_template_kwargs on the MLLM path (parity with the text path in
@@ -2699,41 +2947,22 @@ class MLXMultimodalLM:
                 prompt_cache = None
 
         # Stream generate tokens with cache
-        accumulated_text = ""
-        token_count = 0
         draft_accept_start = self._reset_draft_metrics()
-
-        for chunk in stream_generate(
-            self.model,
-            self.processor,
-            formatted_prompt,
-            all_images if all_images else None,
+        generation_kwargs = _generation_kwargs_with_stop(kwargs, stop)
+        yield from _stream_mllm_generated_outputs(
+            stream_generate_fn=stream_generate,
+            model=self.model,
+            processor=self.processor,
+            formatted_prompt=formatted_prompt,
+            images=all_images if all_images else None,
             audio=all_audio if all_audio else None,
             max_tokens=max_tokens,
-            temp=temperature,
+            temperature=temperature,
             prompt_cache=prompt_cache,
-            **self._draft_generation_kwargs(kwargs),
-            **kwargs,
-        ):
-            token_count += 1
-            # chunk is a GenerationResult with .text attribute containing the new token
-            new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-            accumulated_text += new_text
-
-            yield MLLMOutput(
-                text=new_text,  # Just the new token for streaming
-                finish_reason=None,
-                prompt_tokens=getattr(chunk, "prompt_tokens", 0),
-                completion_tokens=token_count,
-            )
-
-        # Final yield with finish_reason
-        yield MLLMOutput(
-            text="",
-            finish_reason="stop",
-            prompt_tokens=getattr(chunk, "prompt_tokens", 0) if "chunk" in dir() else 0,
-            completion_tokens=token_count,
-            **self._draft_metrics_since(draft_accept_start),
+            draft_kwargs=self._draft_generation_kwargs(generation_kwargs),
+            generation_kwargs=generation_kwargs,
+            stop=stop,
+            draft_metrics=lambda: self._draft_metrics_since(draft_accept_start),
         )
 
     def describe_image(

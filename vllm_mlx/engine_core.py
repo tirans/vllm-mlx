@@ -23,10 +23,40 @@ import mlx.core as mx
 
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig
+from .engine.base import run_blocking_startup_work, suspend_cancellation
 from .output_collector import RequestOutputCollector, RequestStreamState
 from .model_registry import get_registry
 
 logger = logging.getLogger(__name__)
+
+
+def _clear_request_event(request_event: Optional[asyncio.Event]) -> None:
+    if request_event is not None:
+        request_event.clear()
+
+
+def _set_request_event(request_event: Optional[asyncio.Event]) -> None:
+    if request_event is not None:
+        request_event.set()
+
+
+async def _wait_for_idle_or_request(
+    request_event: Optional[asyncio.Event], timeout: float
+) -> None:
+    if timeout <= 0:
+        await asyncio.sleep(0)
+        return
+
+    if request_event is None:
+        await asyncio.sleep(timeout)
+        return
+
+    try:
+        await asyncio.wait_for(request_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        request_event.clear()
 
 
 @dataclass
@@ -35,7 +65,7 @@ class EngineConfig:
 
     model_name: str = ""
     scheduler_config: Optional[SchedulerConfig] = None
-    step_interval: float = 0.001  # 1ms between steps
+    step_interval: float = 0.1  # Idle wait when the scheduler is empty
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     gpu_memory_utilization: float = 0.90  # Fraction of device memory for allocation
 
@@ -55,6 +85,7 @@ class EngineCore:
         config: Optional[EngineConfig] = None,
         engine_id: Optional[str] = None,
         force_model_ownership: bool = True,
+        generation_worker: Optional[ThreadPoolExecutor] = None,
     ):
         """
         Initialize the engine.
@@ -67,10 +98,18 @@ class EngineCore:
             force_model_ownership: If True (default), forcibly take model ownership
                                    from any existing engine. If False, raises
                                    ModelOwnershipError if model is in use.
+            generation_worker: Single thread that already owns the model. MLX
+                               buffers carry the stream of the thread that built
+                               them, so stepping has to happen where the model
+                               was loaded. Callers that load on their own pinned
+                               thread pass it here; otherwise the engine makes
+                               its own, which only works if the model was loaded
+                               on that same thread.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or EngineConfig()
+        self._external_generation_worker = generation_worker
         self._engine_id = engine_id or str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
@@ -101,6 +140,7 @@ class EngineCore:
         # Engine state
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._request_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
@@ -111,7 +151,12 @@ class EngineCore:
         if self._running:
             return
 
+        ensure_ssd_tier = getattr(self.scheduler, "ensure_ssd_tier", None)
+        if ensure_ssd_tier is not None:
+            await asyncio.to_thread(ensure_ssd_tier)
+
         self._running = True
+        self._request_event = asyncio.Event()
         self._start_time = time.time()
         self._task = asyncio.create_task(self._engine_loop())
         logger.info("Engine started")
@@ -119,17 +164,29 @@ class EngineCore:
     async def stop(self) -> None:
         """Stop the engine loop."""
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        try:
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+        finally:
             self._task = None
-        # Safety net: close batch generator if _engine_loop didn't get a
-        # chance to clean up (e.g. it was never started).  The call is
-        # idempotent — _close_batch_generator checks for None.
-        self.scheduler._close_batch_generator()
+            # Safety nets for a loop that never started or whose cleanup
+            # raised. Both operations are idempotent.
+            with suspend_cancellation():
+                try:
+                    worker = getattr(self, "_external_generation_worker", None)
+                    if worker is None:
+                        self.scheduler._close_batch_generator()
+                    else:
+                        await run_blocking_startup_work(
+                            self.scheduler._close_batch_generator,
+                            executor=worker,
+                        )
+                finally:
+                    await asyncio.to_thread(self.scheduler.close_ssd_tier)
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
@@ -139,38 +196,21 @@ class EngineCore:
     async def _engine_loop(self) -> None:
         """Main engine loop.
 
-        scheduler.step runs on one dedicated worker thread, always, and this loop
-        deliberately does NOT bind MLX generation streams to that worker.
-
-        It used to, through a `bind_generation_streams()` helper that has since been
-        deleted outright -- it created a fresh `mx.new_stream()`, which MLX registers in
-        the *calling* thread, and published it into the module-level
-        `mlx_lm.generate.generation_stream` that every engine in the process shares. So
-        an engine arriving at its worker replaced a stream that works everywhere with
-        one that works only on that worker: measured, the main thread afterwards cannot
-        use `generation_stream` at all (`There is no Stream(gpu, 1) in current thread`).
-        With `--multi` that is one engine reaching into another engine's in-flight
-        generation. mlx-lm's own default is a `ThreadLocalStream`, which is already
-        correct for every thread; overwriting it was strictly a downgrade.
-
-        What actually made the worker safe is upstream of here: `Scheduler.__init__`
-        materializes the model's arrays on the constructing thread
-        (`materialize_model_arrays`), so no half-built op graph is left for the
-        worker to finish. Without that the bind only *appeared* to help.
-
-        There used to be a fallback here that, on a stream/thread mismatch, moved
-        stepping onto the event-loop thread instead. It has been removed because it
-        was unreachable, not because it was unwanted: `Scheduler.step` stops
-        re-raising those errors (it recovers in place), so the `except` below never
-        saw one. Measured over a real incident log carrying 10 stream faults, this
-        branch fired 0 times while the scheduler's own handler fired 10. A recovery
-        path that cannot be reached is worse than no path at all, because it reads
-        as coverage -- it was cited as the reason the endpoint would self-heal,
-        while the endpoint was in fact looping.
+        scheduler.step runs on one dedicated worker thread. A caller that loads
+        a model on a pinned thread supplies that same ``generation_worker``.
+        Otherwise this loop creates its own worker. Scheduler initialization
+        materializes model arrays before they cross threads. MLX generation
+        streams stay thread-local; this loop never rebinds a process-wide stream.
         """
 
         loop = asyncio.get_running_loop()
-        worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
+        # getattr, not attribute access: tests and older callers build
+        # EngineCore without going through __init__.
+        external_worker = getattr(self, "_external_generation_worker", None)
+        owns_worker = external_worker is None
+        worker = external_worker or ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="engine-core"
+        )
 
         def _step_on_worker():
             output = self.scheduler.step()
@@ -197,8 +237,8 @@ class EngineCore:
         def _close_batch_generator_on_worker() -> None:
             self.scheduler._close_batch_generator()
 
-        step_interval = self.config.step_interval
         stream_interval = self.config.stream_interval
+        step_interval = self.config.step_interval
         use_simple_streaming = stream_interval == 1
 
         # Emergency memory pressure threshold — dynamic based on gpu_memory_utilization
@@ -216,6 +256,7 @@ class EngineCore:
             while self._running:
                 try:
                     if self.scheduler.has_requests():
+                        _clear_request_event(getattr(self, "_request_event", None))
                         output = await loop.run_in_executor(worker, _step_on_worker)
                         # Yield to event loop after each step.
                         await asyncio.sleep(0)
@@ -236,12 +277,22 @@ class EngineCore:
                                     if use_simple_streaming:
                                         collector.put(req_output)
                                     else:
+                                        # Always put so the collector accumulates
+                                        # every step's new_text; only *release*
+                                        # (notify) on the interval boundary or on
+                                        # finish. Gating the put instead would drop
+                                        # the in-between tokens' text entirely.
                                         state = states.get(rid)
-                                        if state and state.should_send(
-                                            req_output.completion_tokens,
-                                            req_output.finished,
-                                        ):
-                                            collector.put(req_output)
+                                        send = (
+                                            state.should_send(
+                                                req_output.completion_tokens,
+                                                req_output.finished,
+                                            )
+                                            if state
+                                            else True
+                                        )
+                                        collector.put(req_output, notify=send)
+                                        if send and state:
                                             state.mark_sent(
                                                 req_output.completion_tokens
                                             )
@@ -263,8 +314,11 @@ class EngineCore:
                             # making the server unresponsive to all HTTP requests.
                             await asyncio.sleep(0)
                     else:
-                        # No work, yield control
-                        await asyncio.sleep(step_interval)
+                        # No work; wait longer than the active loop but wake
+                        # immediately when add_request signals new work.
+                        await _wait_for_idle_or_request(
+                            getattr(self, "_request_event", None), step_interval
+                        )
 
                 except asyncio.CancelledError:
                     raise
@@ -277,7 +331,15 @@ class EngineCore:
             try:
                 await loop.run_in_executor(worker, _close_batch_generator_on_worker)
             finally:
-                worker.shutdown(wait=True)
+                # Close the SSD writer before joining the worker so any
+                # queued spills flush while the engine is still alive.
+                try:
+                    await asyncio.to_thread(self.scheduler.close_ssd_tier)
+                finally:
+                    # Only tear down a worker this loop created. A caller-supplied
+                    # one owns the loaded model and outlives the engine loop.
+                    if owns_worker:
+                        worker.shutdown(wait=True)
 
     async def add_request(
         self,
@@ -324,24 +386,49 @@ class EngineCore:
         )
         self._finished_events[request_id] = asyncio.Event()
 
-        # Add to scheduler
-        self.scheduler.add_request(request)
+        # Prefix-cache lookup can reconstruct, trim, or dequantize MLX arrays.
+        # Keep that work on the same thread that owns the text model. Standalone
+        # EngineCore callers without a supplied worker retain inline admission.
+        worker = getattr(self, "_external_generation_worker", None)
+        try:
+            if worker is None:
+                self.scheduler.add_request(request)
+            else:
+                await run_blocking_startup_work(
+                    lambda: self.scheduler.add_request(request), executor=worker
+                )
+        except asyncio.CancelledError:
+            self.scheduler.abort_request(request_id)
+            self._cleanup_request_tracking(request_id)
+            _set_request_event(getattr(self, "_request_event", None))
+            raise
+        except BaseException:
+            self.scheduler.abort_request(request_id)
+            self._cleanup_request_tracking(request_id)
+            _set_request_event(getattr(self, "_request_event", None))
+            raise
+        _set_request_event(getattr(self, "_request_event", None))
 
         return request_id
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request."""
         result = self.scheduler.abort_request(request_id)
-        self._cleanup_request(request_id)
+        self._cleanup_request_tracking(request_id)
+        _set_request_event(getattr(self, "_request_event", None))
         return result
 
-    def _cleanup_request(self, request_id: str) -> None:
-        """Clean up request tracking."""
+    def _cleanup_request_tracking(self, request_id: str) -> None:
+        """Drop async output state without racing scheduler-owned cleanup."""
         collector = self._output_collectors.pop(request_id, None)
         if collector:
             collector.clear()
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
+
+    def _cleanup_request(self, request_id: str) -> None:
+        """Clean up request tracking after scheduler processing is complete."""
+        self._cleanup_request_tracking(request_id)
         self.scheduler.remove_finished_request(request_id)
 
     async def stream_outputs(
@@ -671,8 +758,11 @@ class AsyncEngineCore:
         model: Any,
         tokenizer: Any,
         config: Optional[EngineConfig] = None,
+        generation_worker: Optional[ThreadPoolExecutor] = None,
     ):
-        self.engine = EngineCore(model, tokenizer, config)
+        self.engine = EngineCore(
+            model, tokenizer, config, generation_worker=generation_worker
+        )
 
     async def __aenter__(self) -> "AsyncEngineCore":
         await self.engine.start()

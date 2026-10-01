@@ -78,6 +78,11 @@ class Message(BaseModel):
 
     role: str
     content: str | list[ContentPart] | list[dict] | None = None
+    # Preserve returned reasoning when assistant history is replayed to a template.
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    )
     # For assistant messages with tool calls
     tool_calls: list[dict] | None = None
     # For tool response messages (role="tool")
@@ -188,6 +193,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: ResponseFormat | dict | None = None
     # OpenAI-compatible token bias map: token id string -> bias value
     logit_bias: dict[str, float] | None = None
+    # Per-request reasoning effort forwarded through chat template kwargs
+    reasoning_effort: str | None = None
     # Extra kwargs forwarded to tokenizer.apply_chat_template
     chat_template_kwargs: dict[str, Any] | None = None
     # OpenAI-style reasoning effort. Validated against the resolved model's
@@ -210,9 +217,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_backbone_pct: float | None = None
     # Enable/disable thinking mode (None = server default, typically True)
     enable_thinking: bool | None = None
-    # MLLM assistant-drafter path: opt in to using a configured drafter.
-    # Text-only requests also use this flag to leave the default TextModel route
-    # and run through the MLLM path where the drafter can participate.
+    # MLLM assistant-drafter per-request override (None = server default).
+    # Text-only requests use true to leave the default TextModel route and run
+    # through the MLLM path where the drafter can participate.
     mllm_draft: bool | None = None
     # Thinking token budget: cap reasoning tokens by forcing </think> when
     # budget exhausted (None = no budget, unlimited reasoning)
@@ -270,6 +277,17 @@ class GenerationMetadata(BaseModel):
 
     no_final_content_watchdog_tokens: int | None = None
     no_final_content_watchdog_enforced: bool = False
+    mtp_drafts: int | None = None
+    mtp_accepted: int | None = None
+    specprefill_requested: bool | None = None
+    specprefill_engaged: bool | None = None
+    specprefill_reason: str | None = None
+    specprefill_route: str | None = None
+    specprefill_model_module: str | None = None
+    specprefill_language_module: str | None = None
+    specprefill_model_type: str | None = None
+    specprefill_original_tokens: int | None = None
+    specprefill_selected_tokens: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -312,6 +330,8 @@ class CompletionRequest(BaseModel):
     specprefill_keep_pct: float | None = None
     # SpecPrefill: per-request evenly spaced backbone percentage.
     specprefill_backbone_pct: float | None = None
+    # MLLM assistant-drafter per-request override (None = server default).
+    mllm_draft: bool | None = None
 
 
 class CompletionChoice(BaseModel):
@@ -593,3 +613,4 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     usage: Usage | None = None  # Included when stream_options.include_usage=true
+    generation_metadata: GenerationMetadata | None = None
