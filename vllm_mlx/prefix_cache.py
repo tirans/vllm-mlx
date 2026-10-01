@@ -11,6 +11,7 @@ This module provides two implementations:
 """
 
 import copy
+import inspect
 import logging
 import time
 from collections import OrderedDict
@@ -661,6 +662,17 @@ class BlockAwarePrefixCache:
                 class_ref = layer_state.get("class_ref")
                 class_name = layer_state.get("class_name")
 
+                # mlx-lm 0.32 moved KVCache.offset into state. Keep only the
+                # valid key/value positions for block slicing; reconstruction
+                # derives the new offset from the joined blocks.
+                from mlx_lm.models.cache import KVCache
+
+                if class_ref is KVCache and len(state) == 3:
+                    valid_length = int(state[2])
+                    state = tuple(
+                        tensor[..., :valid_length, :] for tensor in state[:2]
+                    )
+
                 seq_axis = self._cache_state_seq_axis(state)
                 if seq_axis is not None:
                     state_slice = self._slice_concat_cache_state(
@@ -927,14 +939,18 @@ class BlockAwarePrefixCache:
                         KVCache as _KVCache,
                     )
 
-                    if cache_cls is _BatchKVCache:
+                    if cache_cls in (_BatchKVCache, _KVCache):
                         keys, values = state[0], state[1]
                         cache = _KVCache()
                         cache.keys = keys
                         cache.values = values
                         cache.offset = keys.shape[self._cache_state_seq_axis(state)]
                     else:
-                        cache = cache_cls.from_state(state, meta_state)
+                        parameters = inspect.signature(cache_cls.from_state).parameters
+                        if "meta_state" in parameters:
+                            cache = cache_cls.from_state(state, meta_state)
+                        else:
+                            cache = cache_cls.from_state(state)
                 else:
                     from mlx_lm.models.cache import KVCache
 

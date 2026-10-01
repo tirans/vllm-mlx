@@ -24,6 +24,7 @@ from vllm_mlx.scheduler import (
     SchedulerConfig,
     SchedulingPolicy,
     _install_chunked_prefill,
+    _left_pad_prompts_compat,
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
@@ -235,6 +236,27 @@ class TestSchedulerConfig:
 class TestSchedulerBasic:
     """Basic tests for Scheduler (without real model)."""
 
+    def test_left_padding_matches_legacy_mlx_lm_helper(self):
+        padded = _left_pad_prompts_compat([[1, 2], [3, 4, 5]])
+        assert padded.tolist() == [[0, 1, 2], [3, 4, 5]]
+
+    def test_cache_state_round_trip_matches_installed_mlx_lm(self):
+        from mlx_lm.models.cache import KVCache
+
+        scheduler = object.__new__(Scheduler)
+        cache = KVCache()
+        cache.keys = mx.ones((1, 2, 3, 4))
+        cache.values = mx.ones((1, 2, 3, 4))
+        cache.offset = 3
+
+        states = scheduler._extract_cache_states([cache])
+        assert len(states) == 1
+        restored = scheduler._reconstruct_cache_from_states(states)
+        assert len(restored) == 1
+        assert isinstance(restored[0], KVCache)
+        assert restored[0].offset == 3
+        assert restored[0].keys.tolist() == cache.keys.tolist()
+
     @pytest.fixture
     def mock_tokenizer(self):
         """Create a mock tokenizer."""
@@ -305,12 +327,6 @@ class TestSchedulerBasic:
                 self._process_prompts = lambda _prompts: None
                 self.model = lambda _inputs, cache=None: None
 
-        monkeypatch.setattr(
-            mlx_generate,
-            "_left_pad_prompts",
-            lambda prompts, max_length=None: mx.array(prompts),
-        )
-
         batch_gen = FakeBatchGenerator()
         _install_chunked_prefill(batch_gen, budget=4)
 
@@ -376,12 +392,6 @@ class TestSchedulerBasic:
                 if self.active_batch is not None:
                     self.active_batch = None
                 return []
-
-        monkeypatch.setattr(
-            mlx_generate,
-            "_left_pad_prompts",
-            lambda prompts, max_length=None: mx.array(prompts),
-        )
 
         batch_gen = FakeBatchGenerator()
         batch_gen.stop_tokens = {99}
@@ -455,12 +465,6 @@ class TestSchedulerBasic:
             def _step(self, inputs, cache, samplers, logits_processors, tokens):
                 step_inputs.append(inputs.tolist())
                 return mx.array([99]), mx.array([-1.0])
-
-        monkeypatch.setattr(
-            mlx_generate,
-            "_left_pad_prompts",
-            lambda prompts, max_length=None: mx.array(prompts),
-        )
 
         batch_gen = FakeBatchGenerator()
         _install_chunked_prefill(batch_gen, budget=2)
@@ -537,12 +541,6 @@ class TestSchedulerBasic:
         monkeypatch.delattr(mlx_generate, "Batch", raising=False)
         monkeypatch.delattr(mlx_generate, "_lazy_extract_cache", raising=False)
         monkeypatch.delattr(mlx_generate, "_make_cache", raising=False)
-        monkeypatch.setattr(
-            mlx_generate,
-            "_left_pad_prompts",
-            lambda prompts, max_length=None: mx.array(prompts),
-        )
-
         batch_gen = FakeBatchGenerator()
         _install_chunked_prefill(batch_gen, budget=1)
 

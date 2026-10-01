@@ -243,6 +243,13 @@ def _install_prompt_cache_save(batch_gen: "BatchGenerator", prompt_cache_save) -
     batch_gen._process_prompts = _patched_process_prompts
 
 
+def _left_pad_prompts_compat(prompts, max_length=None):
+    """Preserve mlx-lm 0.31 padding after its private helper's removal."""
+    if max_length is None:
+        max_length = max(len(prompt) for prompt in prompts)
+    return mx.array([[0] * (max_length - len(prompt)) + prompt for prompt in prompts])
+
+
 def _install_chunked_prefill(
     batch_gen: "BatchGenerator",
     budget: int,
@@ -267,11 +274,9 @@ def _install_chunked_prefill(
     """
     import time as _time
 
-    from mlx_lm.generate import (
-        _left_pad_prompts,
-        _merge_caches,
-        _right_pad_prompts,
-    )
+    from mlx_lm.generate import _merge_caches, _right_pad_prompts
+
+    # mlx-lm 0.32 removed its private left-padding helper.
 
     try:
         from mlx_lm.generate import _lazy_extract_cache
@@ -616,7 +621,9 @@ def _install_chunked_prefill(
                     self._stats.prompt_tokens += sum(lengths)
 
                     if not is_cached:
-                        padded = _left_pad_prompts(inputs_raw, max_length=max_length)
+                        padded = _left_pad_prompts_compat(
+                            inputs_raw, max_length=max_length
+                        )
                         # Batch the per-request caches supplied by the scheduler,
                         # even when they are empty. Rebuilding through
                         # mlx-lm's _make_cache loses max_kv_size for models whose
@@ -2106,9 +2113,11 @@ class Scheduler:
         extracted = []
         for layer_cache in raw_cache:
             try:
-                if hasattr(layer_cache, "state") and hasattr(layer_cache, "meta_state"):
+                if hasattr(layer_cache, "state"):
                     state = layer_cache.state  # (keys, values) or more for Mamba
-                    meta = layer_cache.meta_state  # (offset,) as strings
+                    # mlx-lm 0.32 includes metadata in state and no longer
+                    # exposes meta_state on cache layers.
+                    meta = getattr(layer_cache, "meta_state", None)
                     extracted.append(
                         {
                             "state": state,
@@ -2168,7 +2177,11 @@ class Scheduler:
                         cache.values = values
                         cache.offset = keys.shape[2]
                     else:
-                        cache = cache_cls.from_state(state, meta_state)
+                        parameters = inspect.signature(cache_cls.from_state).parameters
+                        if "meta_state" in parameters:
+                            cache = cache_cls.from_state(state, meta_state)
+                        else:
+                            cache = cache_cls.from_state(state)
                 else:
                     # Fallback: try KVCache manual reconstruction
                     from mlx_lm.models.cache import KVCache

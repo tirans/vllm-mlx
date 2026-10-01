@@ -14,6 +14,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _arrays_cache_entry(arrays):
+    """Build a recurrent-state fixture in the installed MLX-LM state shape."""
+    from mlx_lm.models.cache import ArraysCache
+
+    cache = ArraysCache(len(arrays))
+    for index, array in enumerate(arrays):
+        cache[index] = array
+    return {
+        "state": cache.state,
+        "meta_state": getattr(cache, "meta_state", None),
+        "class_ref": ArraysCache,
+        "class_name": "ArraysCache",
+    }
+
+
 class TestCacheBlock:
     """Test CacheBlock dataclass."""
 
@@ -762,12 +777,7 @@ class TestBlockAwarePrefixCache:
                 "class_ref": KVCache,
                 "class_name": "KVCache",
             },
-            {
-                "state": linear_state,
-                "meta_state": "",
-                "class_ref": ArraysCache,
-                "class_name": "ArraysCache",
-            },
+            _arrays_cache_entry(linear_state),
         ]
 
         block_table = cache.store_cache("req-1", tokens, extracted)
@@ -785,11 +795,11 @@ class TestBlockAwarePrefixCache:
         assert isinstance(reconstructed[1], ArraysCache)
         assert reconstructed[0].state[0].tolist() == kv_keys.tolist()
         assert reconstructed[0].state[1].tolist() == kv_values.tolist()
-        assert reconstructed[1].state[0].tolist() == linear_state[0].tolist()
-        assert reconstructed[1].state[1].tolist() == linear_state[1].tolist()
+        assert reconstructed[1][0].tolist() == linear_state[0].tolist()
+        assert reconstructed[1][1].tolist() == linear_state[1].tolist()
 
     def test_rejects_hybrid_prefix_without_boundary_snapshot(self):
-        from mlx_lm.models.cache import ArraysCache, KVCache
+        from mlx_lm.models.cache import KVCache
         import mlx.core as mx
 
         from vllm_mlx.paged_cache import BlockTable, PagedCacheManager
@@ -808,15 +818,12 @@ class TestBlockAwarePrefixCache:
                 "class_ref": KVCache,
                 "class_name": "KVCache",
             },
-            {
-                "state": [
+            _arrays_cache_entry(
+                [
                     mx.arange(1 * 3 * 8).reshape(1, 3, 8),
                     mx.arange(2000, 2000 + (1 * 2 * 4 * 4)).reshape(1, 2, 4, 4),
-                ],
-                "meta_state": "",
-                "class_ref": ArraysCache,
-                "class_name": "ArraysCache",
-            },
+                ]
+            ),
         ]
 
         block_table = cache.store_cache("req-1", list(range(8)), extracted)
@@ -864,9 +871,39 @@ class TestBlockAwarePrefixCache:
         assert reconstructed[0].state[0].tolist() == kv_keys[:, :4, :].tolist()
         assert reconstructed[0].state[1].tolist() == kv_values[:, :4, :].tolist()
 
+    def test_reconstructs_kv_state_with_offset_and_spare_capacity(self):
+        """The restored offset follows joined blocks, not the source capacity."""
+        from mlx_lm.models.cache import KVCache
+        import mlx.core as mx
+
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        cache = BlockAwarePrefixCache(
+            model=None, paged_cache_manager=PagedCacheManager(block_size=4, max_blocks=10)
+        )
+        layer = KVCache()
+        layer.keys = mx.arange(12).reshape(1, 1, 12, 1)
+        layer.values = layer.keys + 100
+        layer.offset = 8
+        entry = {
+            "state": layer.state,
+            "meta_state": getattr(layer, "meta_state", None),
+            "class_ref": KVCache,
+            "class_name": "KVCache",
+        }
+
+        table = cache.store_cache("req", list(range(8)), [entry])
+        restored = cache.reconstruct_cache(table)
+
+        assert restored is not None
+        assert restored[0].offset == 8
+        assert restored[0].keys.shape[-2] == 8
+        assert restored[0].keys.tolist() == layer.keys[..., :8, :].tolist()
+
     def test_deduplicated_terminal_uses_correct_recurrent_snapshot(self):
         """Deduplication must not leak recurrent state across sequences."""
-        from mlx_lm.models.cache import ArraysCache, KVCache
+        from mlx_lm.models.cache import KVCache
         import mlx.core as mx
 
         from vllm_mlx.paged_cache import PagedCacheManager
@@ -885,12 +922,7 @@ class TestBlockAwarePrefixCache:
                 "class_ref": KVCache,
                 "class_name": "KVCache",
             },
-            {
-                "state": recurrent_a,
-                "meta_state": "",
-                "class_ref": ArraysCache,
-                "class_name": "ArraysCache",
-            },
+            _arrays_cache_entry(recurrent_a),
         ]
         bt_a = cache.store_cache("req-a", list(range(8)), extracted_a)
 
@@ -904,21 +936,16 @@ class TestBlockAwarePrefixCache:
                 "class_ref": KVCache,
                 "class_name": "ArraysCache",
             },
-            {
-                "state": recurrent_b,
-                "meta_state": "",
-                "class_ref": ArraysCache,
-                "class_name": "ArraysCache",
-            },
+            _arrays_cache_entry(recurrent_b),
         ]
         bt_b = cache.store_cache("req-b", list(range(12)), extracted_b)
 
         # Reconstruct A: should use A's recurrent state (ones), not B's (twos)
         recon_a = cache.reconstruct_cache(bt_a)
         assert recon_a is not None
-        assert recon_a[1].state[0].tolist() == recurrent_a[0].tolist()
+        assert recon_a[1][0].tolist() == recurrent_a[0].tolist()
 
         # Reconstruct B: should use B's recurrent state (twos)
         recon_b = cache.reconstruct_cache(bt_b)
         assert recon_b is not None
-        assert recon_b[1].state[0].tolist() == recurrent_b[0].tolist()
+        assert recon_b[1][0].tolist() == recurrent_b[0].tolist()

@@ -60,6 +60,9 @@ def _install_mlx_stubs() -> None:
     core.new_stream = lambda *a, **k: _Stream()
     core.set_default_stream = lambda *a, **k: None
     core.clear_cache = lambda: None
+    # Other Linux tests can import this collection-time stub. Their fake KV
+    # arrays need the same no-op materialization call that real MLX provides.
+    core.eval = lambda *arrays: None
     core.metal = types.SimpleNamespace(
         get_active_memory=lambda: 0,
         get_peak_memory=lambda: 0,

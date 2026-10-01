@@ -117,6 +117,17 @@ def _nested_array_memory(value: Any) -> int:
     return _array_memory(value)
 
 
+def _state_contains_identity(state: Any, target: Any) -> bool:
+    """Check whether a cache state already includes a metadata array."""
+    if state is target:
+        return True
+    if isinstance(state, dict):
+        return any(_state_contains_identity(item, target) for item in state.values())
+    if isinstance(state, (list, tuple)):
+        return any(_state_contains_identity(item, target) for item in state)
+    return False
+
+
 def estimate_kv_cache_memory(cache: list[Any]) -> int:
     """
     Estimate memory usage of a KV cache in bytes.
@@ -187,14 +198,20 @@ def estimate_kv_cache_memory(cache: list[Any]) -> int:
             # mappings, and the old two-way unpack silently measured those
             # as 0.
             try:
-                total_bytes += _nested_array_memory(layer_cache.state)
+                state = layer_cache.state
+                total_bytes += _nested_array_memory(state)
             except (TypeError, ValueError):
-                pass
+                state = None
             # Detachment also copies these metadata arrays on state-carrying
-            # layers; price them so accounting equals snapshot residency.
+            # layers. mlx-lm 0.32 includes them in ArraysCache.state already,
+            # while 0.31 exposes them only as attributes. Count each once.
             for attr in ("left_padding", "lengths"):
                 extra = getattr(layer_cache, attr, None)
-                if extra is not None and hasattr(extra, "shape"):
+                if (
+                    extra is not None
+                    and hasattr(extra, "shape")
+                    and not _state_contains_identity(state, extra)
+                ):
                     total_bytes += _array_memory(extra)
 
     return total_bytes

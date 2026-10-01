@@ -228,6 +228,28 @@ class TestArrayMemory:
         )
         assert estimate_kv_cache_memory([NestedStateCache()]) == expected
 
+    def test_state_metadata_is_priced_once(self):
+        """MLX-LM 0.32 exposes metadata in state and as attributes."""
+
+        class StateWithMetadata:
+            def __init__(self):
+                self.left_padding = MockShapeArray((2,), 4)
+                self.lengths = MockShapeArray((2,), 4)
+                self.state = ([MockArray(64)], self.left_padding, self.lengths)
+
+        assert estimate_kv_cache_memory([StateWithMetadata()]) == 80
+
+    def test_state_external_metadata_is_still_priced(self):
+        """MLX-LM 0.31 keeps metadata outside state."""
+
+        class StateWithExternalMetadata:
+            def __init__(self):
+                self.left_padding = MockShapeArray((2,), 4)
+                self.lengths = MockShapeArray((2,), 4)
+                self.state = [MockArray(64)]
+
+        assert estimate_kv_cache_memory([StateWithExternalMetadata()]) == 80
+
 
 class TestEstimateKvCacheMemory:
     """Tests for estimate_kv_cache_memory function."""
