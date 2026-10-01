@@ -65,7 +65,8 @@ The repaired G2 baseline and G4 candidate counts, revisions and external log
 paths are recorded in the [plan](../superpowers/plans/2026-10-01-fork-maintenance.md).
 The policy extraction is integrated at `1036ca3`; targeted local QA and both
 full suite orders passed. Publication of `ac58df4` to the fork was verified;
-hosted CI results remain pending. See the plan for the publication receipt.
+the later CI compatibility follow-up passed local old/new dependency suites
+and both hosted workflows at `1ff0a2e`. See the plan for run links and receipts.
 
 ## Validation gates
 

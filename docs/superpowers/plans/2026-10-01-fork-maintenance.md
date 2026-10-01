@@ -23,7 +23,8 @@ results remain pending. This completion covers implementation and local QA.
 
 ## Hosted CI follow-up (2026-10-01)
 
-Status: **LOCAL ACCEPTANCE COMPLETE** at `a3dd01a`; hosted validation pending.
+Status: **COMPLETE**. Local acceptance is bound to `a3dd01a`; hosted CI
+passed on published commit `1ff0a2e`, whose runtime/test/workflow trees match it.
 This follow-up began after publication of `952a609`. The earlier local
 acceptance remains a dated result for its installed dependencies; it does not
 clear the newly observed hosted failures.
@@ -101,8 +102,26 @@ path above. These are Darwin CPU checks, not hosted Linux matrix results.
 Independent task reviews and the combined review approved the final source.
 The existing independent reviewer performed the combined review because a fresh
 reviewer thread was unavailable. GPU runs were serialized; no shared service was
-restarted. The shared dependency environment was not upgraded. Hosted reruns
-remain pending until the repair commits are published and GitHub completes them.
+restarted. The shared dependency environment was not upgraded.
+
+### Hosted acceptance and publication
+
+Normal push published `1ff0a2e3870f394afacedaece4bc6bc37555586f`, and
+`git ls-remote origin refs/heads/main` confirmed it. All eight outgoing repair
+commits passed the redacted credential-pattern scan; `.env` remains ignored.
+
+Both hosted workflows completed successfully at that commit:
+
+- [Fork regressions, run 36893218082](https://github.com/tirans/vllm-mlx/actions/runs/36893218082):
+  Linux policy Python 3.10/3.13 and Apple fixtures Python 3.11/3.13 passed.
+- [Existing CI, run 36893218066](https://github.com/tirans/vllm-mlx/actions/runs/36893218066):
+  lint, Linux Python 3.10–3.13, Python 3.14 engine tests, both Apple jobs
+  including stream-affinity checks, and the required aggregate gate passed.
+  The upstream mypy step still reports advisory errors under its existing
+  `continue-on-error` setting; workflow success is not a clean type-check claim.
+
+This acceptance receipt changes documentation only. No CI gates, dependency
+constraints or published history were weakened or rewritten.
 
 ## Global constraints
 
