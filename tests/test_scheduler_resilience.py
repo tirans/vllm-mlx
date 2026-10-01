@@ -29,7 +29,7 @@ from vllm_mlx.scheduler import (
 def _make_scheduler(**config_kwargs) -> Scheduler:
     model = MagicMock()
     tokenizer = MagicMock()
-    tokenizer.encode = lambda x: list(range(len(x.split())))
+    tokenizer.encode = lambda x, add_special_tokens=True: list(range(len(x.split())))
     tokenizer.eos_token_id = 0
 
     config = SchedulerConfig(

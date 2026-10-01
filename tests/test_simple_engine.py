@@ -12,6 +12,13 @@ import pytest
 pytestmark = pytest.mark.anyio
 
 
+class _TextRouteTokenizer(MagicMock):
+    """Give mlx-lm's wrapper a real tokenizer-class template method."""
+
+    def apply_chat_template(self, *args, **kwargs):
+        return []
+
+
 class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""
 
@@ -1736,7 +1743,7 @@ class TestSimpleEngineConcurrency:
         captured = {}
         text_model = MagicMock()
         text_model.mtp = None
-        tokenizer = MagicMock()
+        tokenizer = _TextRouteTokenizer()
         tokenizer.convert_tokens_to_ids.return_value = 42
 
         mock_mllm = MagicMock()
@@ -1800,7 +1807,7 @@ class TestSimpleEngineConcurrency:
 
         text_model = MagicMock()
         text_model.mtp = None
-        tokenizer = MagicMock()
+        tokenizer = _TextRouteTokenizer()
         tokenizer.convert_tokens_to_ids.return_value = 42
 
         mock_mllm = MagicMock()
