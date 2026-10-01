@@ -1,0 +1,163 @@
+name: Fork regressions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  effort-policy-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest only
+        run: python -m pip install pytest
+
+      - name: Run pure policy tests and check import boundary
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import sys
+
+          import pytest
+
+          result = pytest.main([
+              "-q", "-ra", "--tb=short", "tests/test_effort_policy.py",
+          ])
+          forbidden = sorted(
+              name for name in sys.modules
+              if name == "vllm_mlx.server"
+              or name.startswith("vllm_mlx.server.")
+              or name == "mlx"
+              or name.startswith("mlx.")
+              or name == "mlx_lm"
+              or name.startswith("mlx_lm.")
+          )
+          if forbidden:
+              print(f"Pure policy tests imported runtime modules: {forbidden}")
+          raise SystemExit(int(result) or bool(forbidden))
+          PY
+
+  fork-fixtures-apple-silicon:
+    runs-on: macos-14
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,vision,harmony]"
+
+      - name: Require Apple Silicon and real MLX
+        run: |
+          python - <<'PY'
+          from importlib.metadata import version
+          import platform
+
+          assert platform.system() == "Darwin" and platform.machine() == "arm64"
+          import mlx.core as mx
+          import mlx_lm
+
+          assert hasattr(mx, "clear_streams"), "Fork stream guards require MLX >= 0.32"
+          print(f"Installed MLX {version('mlx')}, MLX-LM {version('mlx-lm')}")
+          print(f"Apple Silicon MLX device: {mx.default_device()}")
+          PY
+          python -m pip show mlx mlx-lm
+
+      - name: Run fork fixture regressions
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          python - <<'PY'
+          import pytest
+
+          class NoSkippedForkFixtures:
+              skipped = []
+
+              def pytest_collectreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+
+              def pytest_runtest_logreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+
+          gate = NoSkippedForkFixtures()
+          result = pytest.main([
+              "-q", "-ra", "--tb=short",
+              "tests/test_effort_policy.py",
+              "tests/test_reasoning_effort.py",
+              "tests/test_chat_template_kwargs.py",
+              "tests/test_responses_api.py",
+              "tests/test_server_engine_busy.py",
+              "tests/test_memory_cache_thread_affinity.py",
+              "tests/test_simple_engine.py",
+              "tests/test_simple_engine_thread_pinning.py",
+              "tests/test_simple_engine_cancel_serialization.py",
+              "tests/test_scheduler_resilience.py",
+              "tests/test_mllm_scheduler_resilience.py",
+              "tests/test_model_registry.py",
+              "tests/test_cli.py",
+          ], plugins=[gate])
+          if gate.skipped:
+              print(f"Required fork fixtures skipped: {gate.skipped}")
+          raise SystemExit(int(result) or bool(gate.skipped))
+          PY
+
+      - name: Run MLX stream ownership fixtures in a fresh process
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          python - <<'PY'
+          import pytest
+
+          class NoSkippedStreamFixtures:
+              skipped = []
+
+              def pytest_collectreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+
+              def pytest_runtest_logreport(self, report):
+                  if report.skipped:
+                      self.skipped.append(report.nodeid)
+
+          gate = NoSkippedStreamFixtures()
+          result = pytest.main([
+              "-q", "-ra", "--tb=short",
+              "tests/test_engine_core_thread_streams.py",
+          ], plugins=[gate])
+          if gate.skipped:
+              print(f"Required stream fixtures skipped: {gate.skipped}")
+          raise SystemExit(int(result) or bool(gate.skipped))
+          PY
