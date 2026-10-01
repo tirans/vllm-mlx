@@ -168,6 +168,7 @@ from .endpoint_model_policies import (
     resolve_tts_model_name,
 )
 from .engine.base import EngineBusy, suspend_cancellation
+from .effort_policy import resolve_reasoning_effort
 from .lifecycle import ModelSpec, ResidencyManager
 from .model_registry import (
     ModelLease,
@@ -373,38 +374,23 @@ def _apply_reasoning_effort(
     effort = request_effort or (ctk or {}).get("reasoning_effort")
     if effort is None:
         return
-    if request.reasoning_effort is not None:
-        ctk = dict(ctk or {})
-        ctk["reasoning_effort"] = request.reasoning_effort
-        chat_kwargs["chat_template_kwargs"] = ctk
-        effort = request.reasoning_effort
     supported = _supported_reasoning_efforts(engine, request.model)
-    if supported is None:
-        if request_effort is None:
-            chat_kwargs["chat_template_kwargs"] = {
-                k: v for k, v in (ctk or {}).items() if k != "reasoning_effort"
-            }
-            logger.debug(
-                "Dropping server-default reasoning_effort: model %r does not support it",
-                request.model,
-            )
-            return
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"model {request.model!r} does not support reasoning_effort "
-                "(its chat template ignores the parameter); remove it or use a "
-                "model whose /v1/models entry lists reasoning_efforts"
-            ),
+    resolution = resolve_reasoning_effort(
+        resolved_template_kwargs=ctk,
+        request_effort=request.reasoning_effort,
+        request_template_kwargs=request.chat_template_kwargs,
+        supported_efforts=supported,
+        model_name=request.model,
+    )
+    if resolution.replace_kwargs:
+        chat_kwargs["chat_template_kwargs"] = resolution.template_kwargs
+    if resolution.dropped_default:
+        logger.debug(
+            "Dropping server-default reasoning_effort: model %r does not support it",
+            request.model,
         )
-    if supported and effort not in supported:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"reasoning_effort {effort!r} is not supported by model "
-                f"{request.model!r}; supported values: {', '.join(supported)}"
-            ),
-        )
+    if resolution.error_detail is not None:
+        raise HTTPException(status_code=400, detail=resolution.error_detail)
 
 
 @dataclass

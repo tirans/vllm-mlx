@@ -120,6 +120,19 @@ def _fresh_cache():
 
 
 class TestApplyReasoningEffort:
+    def test_absent_effort_keeps_kwargs_shape_without_probing(self, monkeypatch):
+        from vllm_mlx import server
+
+        def fail_probe(*args):
+            raise AssertionError("no-effort request probed model template")
+
+        monkeypatch.setattr(server, "_supported_reasoning_efforts", fail_probe)
+        chat_kwargs = {"temperature": 0.2}
+
+        server._apply_reasoning_effort(chat_kwargs, _PlainEngine(), _request())
+
+        assert chat_kwargs == {"temperature": 0.2}
+
     def test_top_level_effort_merges_into_chat_template_kwargs(self):
         from vllm_mlx.server import _apply_reasoning_effort
 
@@ -147,6 +160,49 @@ class TestApplyReasoningEffort:
             _apply_reasoning_effort({}, _GuardedEngine(), request)
         assert exc.value.status_code == 400
         assert "low, medium, xhigh" in exc.value.detail
+
+    def test_top_level_override_is_written_before_vocabulary_error(self):
+        from vllm_mlx.server import _apply_reasoning_effort
+
+        original = {"reasoning_effort": "medium", "enable_thinking": False}
+        chat_kwargs = {"chat_template_kwargs": original}
+        with pytest.raises(HTTPException) as exc:
+            _apply_reasoning_effort(
+                chat_kwargs, _GuardedEngine(), _request(reasoning_effort="high")
+            )
+
+        assert exc.value.status_code == 400
+        assert chat_kwargs["chat_template_kwargs"] == {
+            "reasoning_effort": "high",
+            "enable_thinking": False,
+        }
+        assert chat_kwargs["chat_template_kwargs"] is not original
+        assert original["reasoning_effort"] == "medium"
+
+    def test_invalid_server_default_is_rejected_on_guarded_template(self):
+        from vllm_mlx.server import _apply_reasoning_effort
+
+        chat_kwargs = {"chat_template_kwargs": {"reasoning_effort": "high"}}
+        with pytest.raises(HTTPException) as exc:
+            _apply_reasoning_effort(chat_kwargs, _GuardedEngine(), _request())
+
+        assert exc.value.status_code == 400
+        assert "supported values: low, medium, xhigh" in exc.value.detail
+
+    def test_unknown_vocabulary_passes_effort_through(self, monkeypatch):
+        from vllm_mlx import server
+
+        monkeypatch.setattr(server, "_supported_reasoning_efforts", lambda *a: ())
+        chat_kwargs = {
+            "chat_template_kwargs": {"reasoning_effort": "custom", "other": 1}
+        }
+
+        server._apply_reasoning_effort(chat_kwargs, _GuardedEngine(), _request())
+
+        assert chat_kwargs["chat_template_kwargs"] == {
+            "reasoning_effort": "custom",
+            "other": 1,
+        }
 
     def test_effort_on_unsupporting_model_is_400(self):
         from vllm_mlx.server import _apply_reasoning_effort
@@ -176,6 +232,27 @@ class TestApplyReasoningEffort:
         request = _request()  # request itself carries no effort
         _apply_reasoning_effort(chat_kwargs, _PlainEngine(), request)
         assert "reasoning_effort" not in chat_kwargs["chat_template_kwargs"]
+
+    def test_falsey_request_template_effort_is_rejected_as_explicit(self):
+        from vllm_mlx.server import _apply_reasoning_effort
+
+        chat_kwargs = {
+            "chat_template_kwargs": {
+                "reasoning_effort": "",
+                "enable_thinking": False,
+            }
+        }
+        request = _request(chat_template_kwargs={"reasoning_effort": ""})
+
+        with pytest.raises(HTTPException) as exc:
+            _apply_reasoning_effort(chat_kwargs, _PlainEngine(), request)
+
+        assert exc.value.status_code == 400
+        assert "does not support reasoning_effort" in exc.value.detail
+        assert chat_kwargs["chat_template_kwargs"] == {
+            "reasoning_effort": "",
+            "enable_thinking": False,
+        }
 
     def test_no_effort_anywhere_is_untouched(self):
         from vllm_mlx.server import _apply_reasoning_effort
