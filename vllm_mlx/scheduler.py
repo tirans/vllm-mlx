@@ -4128,7 +4128,21 @@ class Scheduler:
                             if dt is not None:
                                 state_arrays[i] = state_arrays[i].astype(dt)
                     layer_obj = ArraysCache(len(state_arrays))
-                    layer_obj.state = state_arrays
+                    # MLX-LM 0.32's state setter expects (cache,
+                    # left_padding, lengths), while 0.31 expects only cache.
+                    # Both expose the mutable cache list directly.
+                    layer_obj.cache = state_arrays
+                    for attr in ("left_padding", "lengths"):
+                        value = ld.get(attr)
+                        if value is None:
+                            continue  # legacy state-only SSD entry
+                        restored = mx.array(value)
+                        dtype_name = ld.get(f"{attr}_original_dtype")
+                        if dtype_name is not None:
+                            dt = _mx_dtype_from_name(dtype_name)
+                            if dt is not None:
+                                restored = restored.astype(dt)
+                        setattr(layer_obj, attr, restored)
                     result.append(layer_obj)
                 else:
                     logger.warning(

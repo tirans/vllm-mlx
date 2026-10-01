@@ -602,13 +602,17 @@ class KVCacheSerializer(LayerSerializer):
 class ArraysCacheSerializer(LayerSerializer):
     """Serializer for ArraysCache (Mamba/linear attention) layers.
 
-    Handles layers with .state attribute containing a list of arrays.
+    Preserve the cache arrays and optional per-row metadata across MLX-LM's
+    list-state (0.31) and tuple-state (0.32) representations.
     """
 
     def snapshot_layer(self, layer: Any) -> dict[str, Any]:
         state_np: list[np.ndarray] = []
         original_dtypes: list[str | None] = []
-        for arr in layer.state:
+        cache_arrays = getattr(layer, "cache", None)
+        if cache_arrays is None:
+            cache_arrays = layer.state
+        for arr in cache_arrays:
             np_arr, orig = _mx_to_numpy_safe(arr)
             state_np.append(np_arr)
             original_dtypes.append(orig)
@@ -617,6 +621,12 @@ class ArraysCacheSerializer(LayerSerializer):
         # Skip the dtype list in the common (fp16/fp32) case.
         if any(d is not None for d in original_dtypes):
             snapshot["state_original_dtypes"] = original_dtypes
+        for attr in ("left_padding", "lengths"):
+            value = getattr(layer, attr, None)
+            if value is not None:
+                snapshot[f"{attr}_np"], original_dtype = _mx_to_numpy_safe(value)
+                if original_dtype is not None:
+                    snapshot[f"{attr}_original_dtype"] = original_dtype
         return snapshot
 
     def serialize_layer(
@@ -629,15 +639,31 @@ class ArraysCacheSerializer(LayerSerializer):
         tensors = {
             f"layer_{layer_idx}_state_{i}": arr for i, arr in enumerate(state_np)
         }
+        for attr in ("left_padding", "lengths"):
+            if f"{attr}_np" in snapshot:
+                tensors[f"layer_{layer_idx}_{attr}"] = snapshot[f"{attr}_np"]
         save_file(tensors, file_path)
 
         metadata = {
-            "layer_type": "ArraysCache",
+            # Old readers reject the new layer type instead of silently
+            # dropping the metadata needed to interpret this cache.
+            "layer_type": (
+                "ArraysCacheV2"
+                if any(f"{attr}_np" in snapshot for attr in ("left_padding", "lengths"))
+                else "ArraysCache"
+            ),
             "layer_idx": layer_idx,
             "num_arrays": len(state_np),
         }
         if "state_original_dtypes" in snapshot:
             metadata["state_original_dtypes"] = snapshot["state_original_dtypes"]
+        for attr in ("left_padding", "lengths"):
+            if f"{attr}_np" in snapshot:
+                metadata[f"has_{attr}"] = True
+                if f"{attr}_original_dtype" in snapshot:
+                    metadata[f"{attr}_original_dtype"] = snapshot[
+                        f"{attr}_original_dtype"
+                    ]
         return metadata
 
     def deserialize_layer(self, file_path: str, metadata: dict[str, Any]) -> dict:
@@ -653,6 +679,17 @@ class ArraysCacheSerializer(LayerSerializer):
         result = {"state": state}
         if "state_original_dtypes" in metadata:
             result["state_original_dtypes"] = metadata["state_original_dtypes"]
+        if metadata["layer_type"] == "ArraysCacheV2" and not any(
+            metadata.get(f"has_{attr}") for attr in ("left_padding", "lengths")
+        ):
+            raise ValueError("ArraysCacheV2 layer has no metadata arrays")
+        for attr in ("left_padding", "lengths"):
+            if metadata.get(f"has_{attr}"):
+                result[attr] = tensors[f"layer_{layer_idx}_{attr}"]
+                if f"{attr}_original_dtype" in metadata:
+                    result[f"{attr}_original_dtype"] = metadata[
+                        f"{attr}_original_dtype"
+                    ]
         return result
 
 
@@ -777,7 +814,7 @@ def get_serializer_for_layer(layer: Any) -> LayerSerializer:
     Dispatches based on duck-typing:
     - If layer has .caches (DSA CacheList) -> CacheListSerializer
     - If layer has .keys and .values and .offset -> KVCacheSerializer
-    - If layer has .state and it's a list -> ArraysCacheSerializer
+    - If layer has list .state or 0.32 tuple .state -> ArraysCacheSerializer
 
     The CacheList check comes first because a CacheList ALSO has a list
     ``.state`` and would otherwise be mis-routed to ArraysCacheSerializer.
@@ -788,7 +825,10 @@ def get_serializer_for_layer(layer: Any) -> LayerSerializer:
         return CacheListSerializer()
     if hasattr(layer, "keys") and hasattr(layer, "values") and hasattr(layer, "offset"):
         return KVCacheSerializer()
-    if hasattr(layer, "state") and isinstance(getattr(layer, "state", None), list):
+    state = getattr(layer, "state", None)
+    if isinstance(state, list) or (
+        isinstance(state, tuple) and len(state) == 3 and isinstance(state[0], list)
+    ):
         return ArraysCacheSerializer()
     raise ValueError(
         f"Unsupported cache layer type: {type(layer).__name__}. "
@@ -1314,7 +1354,7 @@ class SSDCacheTier:
             try:
                 if layer_type in ("KVCache", "RotatingKVCache"):
                     serializer = KVCacheSerializer()
-                elif layer_type in ("ArraysCache", "MambaCache"):
+                elif layer_type in ("ArraysCache", "ArraysCacheV2", "MambaCache"):
                     serializer = ArraysCacheSerializer()
                 elif layer_type == "CacheList":
                     serializer = CacheListSerializer()

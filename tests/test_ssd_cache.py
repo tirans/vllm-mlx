@@ -87,6 +87,7 @@ class TestSSDCacheStats:
 
 
 import os
+import json
 
 from vllm_mlx import ssd_cache as ssd_cache_module
 from vllm_mlx.ssd_cache import SSDIndex
@@ -1185,20 +1186,91 @@ class TestIntegrationSpillAndFetch:
 
         tier.close()
 
-    def test_scheduler_reconstructs_real_arrays_cache(self):
+    def test_scheduler_reconstructs_legacy_arrays_cache_entry(self, tmp_path):
+        """Existing state-only SSD entries remain readable on both MLX-LM APIs."""
         cache_mod = pytest.importorskip("mlx_lm.models.cache")
         mx = pytest.importorskip("mlx.core")
         from vllm_mlx.scheduler import Scheduler
 
-        scheduler = object.__new__(Scheduler)
-        reconstructed = Scheduler._reconstruct_ssd_layers(
-            scheduler,
-            [{"state": [np.array([1, 2], dtype=np.float32)]}],
-        )
+        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path / "legacy_arrays")))
+        tokens = (1, 2)
+        serializer = ArraysCacheSerializer()
+        snapshot = {"state_np": [np.array([1, 2], dtype=np.float32)]}
+        try:
+            tier._write_entry(tokens, [(serializer, snapshot)], memory_bytes=100)
+            entry = tier._index.lookup_exact(tokens)
+            assert entry is not None
+            manifest_path = os.path.join(
+                tier._data_dir, entry["file_path"], "manifest.json"
+            )
+            with open(manifest_path) as manifest_file:
+                manifest = json.load(manifest_file)
+            assert manifest["layers"][0]["layer_type"] == "ArraysCache"
+
+            promoted = asyncio.run(
+                tier.async_promote(tokens, lambda n: True, lambda n: None)
+            )
+            assert promoted is not None
+            scheduler = object.__new__(Scheduler)
+            reconstructed = Scheduler._reconstruct_ssd_layers(scheduler, promoted)
+        finally:
+            tier.close()
 
         assert reconstructed is not None
         assert isinstance(reconstructed[0], cache_mod.ArraysCache)
-        assert reconstructed[0].state[0].tolist() == mx.array([1, 2]).tolist()
+        assert reconstructed[0][0].tolist() == mx.array([1, 2]).tolist()
+        assert reconstructed[0].left_padding is None
+        assert reconstructed[0].lengths is None
+
+    def test_real_arrays_cache_metadata_survives_ssd_round_trip(self, tmp_path):
+        """The new state shape and per-row metadata survive tier promotion."""
+        cache_mod = pytest.importorskip("mlx_lm.models.cache")
+        mx = pytest.importorskip("mlx.core")
+        from vllm_mlx.scheduler import Scheduler
+
+        layer = cache_mod.ArraysCache(2, left_padding=[0, 1])
+        layer[0] = mx.array([[1, 2], [3, 4]])
+        layer[1] = mx.array([[5, 6], [7, 8]])
+        layer.lengths = mx.array([2, 3])
+
+        tier = SSDCacheTier(SSDCacheConfig(cache_dir=str(tmp_path / "real_arrays")))
+        tier.start_writer()
+        tokens = (1, 2, 3)
+        try:
+            assert tier.enqueue_spill(tokens, [layer], memory_bytes=100)
+            deadline = time.monotonic() + 5.0
+            while tier._stats.spill_count == 0 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert tier._stats.spill_count == 1
+            entry = tier._index.lookup_exact(tokens)
+            assert entry is not None
+            manifest_path = os.path.join(
+                tier._data_dir, entry["file_path"], "manifest.json"
+            )
+            with open(manifest_path) as manifest_file:
+                manifest = json.load(manifest_file)
+            assert manifest["layers"][0]["layer_type"] == "ArraysCacheV2"
+
+            promoted = asyncio.run(
+                tier.async_promote(tokens, lambda n: True, lambda n: None)
+            )
+            assert promoted is not None
+            assert len(promoted) == 1
+            assert promoted[0]["left_padding"].tolist() == [0, 1]
+            assert promoted[0]["lengths"].tolist() == [2, 3]
+            scheduler = object.__new__(Scheduler)
+            reconstructed = Scheduler._reconstruct_ssd_layers(scheduler, promoted)
+        finally:
+            tier.close()
+
+        assert reconstructed is not None
+        restored = reconstructed[0]
+        assert isinstance(restored, cache_mod.ArraysCache)
+        assert restored[0].tolist() == layer[0].tolist()
+        assert restored[1].tolist() == layer[1].tolist()
+        assert restored.left_padding.tolist() == [0, 1]
+        assert restored.lengths.tolist() == [2, 3]
+        assert restored.cache is not layer.cache
 
     def test_capacity_eviction_end_to_end(self, tmp_path):
         """Entries beyond max_entries are evicted from SSD."""

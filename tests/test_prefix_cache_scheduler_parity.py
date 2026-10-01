@@ -24,11 +24,19 @@ class _Tokenizer:
 
     @staticmethod
     def encode(text, **_kwargs):
-        return [int(token) for token in text.split()]
+        try:
+            return [int(token) for token in text.split()]
+        except ValueError:
+            # MLX-LM 0.32 probes ordinary text when constructing its
+            # detokenizer; keep numeric prompt IDs unchanged for this model.
+            return [1000 + ord(char) for char in text]
 
     @staticmethod
     def decode(tokens, **_kwargs):
-        return "".join(chr(65 + int(token) % 26) for token in tokens)
+        return "".join(
+            chr(int(token) - 1000) if int(token) >= 1000 else chr(65 + int(token) % 26)
+            for token in tokens
+        )
 
 
 class _CacheWritingModel(nn.Module):
