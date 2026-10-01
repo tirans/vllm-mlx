@@ -125,11 +125,26 @@ Create `mcp.json`:
 | `VLLM_MLX_TEST_MODEL` | Default model for tests | — |
 | `HF_TOKEN` | HuggingFace authentication token | — |
 | `OPENAI_API_KEY` | Set to any value for SDK compatibility | — |
+| `VLLM_MLX_API_KEY` | API key required by the server when `--api-key` is omitted | — |
 | `VLLM_MLX_SIMPLE_ENGINE_LOCK_ADMISSION` | SimpleEngine admission policy: `queue`, `wait`, or `fail_fast` | `queue` |
 | `VLLM_MLX_SIMPLE_ENGINE_MAX_QUEUE` | Requests allowed to wait for the serialized route before a 503 | `32` |
 | `VLLM_MLX_SIMPLE_ENGINE_QUEUE_TIMEOUT_S` | Seconds a request may wait in the queue before a 503 (`0` disables) | `120` |
 | `VLLM_MLX_SIMPLE_ENGINE_RETRY_AFTER_S` | Value advertised in the `Retry-After` header on a 503 | `2` |
 | `VLLM_MLX_SYSTEM_KV_SLOTS` | System-prefix KV cache slots (LRU) | `4` |
+
+For local API authentication, copy `.env.example` to `.env`, set
+`VLLM_MLX_API_KEY`, then load the file into the shell before starting the
+server:
+
+```bash
+set -a
+source .env
+set +a
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit
+```
+
+The explicit `--api-key` option overrides `VLLM_MLX_API_KEY`. Real `.env` files
+are ignored by Git; keep credentials out of tracked files.
 
 ### Serialized Engine Admission
 

@@ -129,7 +129,9 @@ For registry-backed serving, see [Multi-Model Serving](../guides/model-registry.
 
 ### Security
 
-When `--api-key` is set, all API requests require the `Authorization: Bearer <api-key>` header:
+Set `VLLM_MLX_API_KEY` or pass `--api-key` to require authentication. The
+command-line option takes precedence. All API requests then require the
+`Authorization: Bearer <api-key>` header:
 
 ```python
 from openai import OpenAI

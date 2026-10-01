@@ -92,7 +92,8 @@ def serve_command(args):
         sys.exit(1)
 
     # Configure server security settings
-    server._api_key = args.api_key
+    api_key = args.api_key or os.environ.get("VLLM_MLX_API_KEY")
+    server._api_key = api_key
     server._default_timeout = args.timeout
     server._metrics_enabled = args.enable_metrics
     server._metrics.configure(enabled=args.enable_metrics)
@@ -165,10 +166,12 @@ def serve_command(args):
     print("=" * 60)
     print("SECURITY CONFIGURATION")
     print("=" * 60)
-    if args.api_key:
+    if api_key:
         print("  Authentication: ENABLED (API key required)")
     else:
-        print("  Authentication: DISABLED - Use --api-key to enable")
+        print(
+            "  Authentication: DISABLED - Set VLLM_MLX_API_KEY or use --api-key"
+        )
     if args.rate_limit > 0:
         print(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
     else:
@@ -1292,7 +1295,7 @@ Examples:
         "--api-key",
         type=str,
         default=None,
-        help="API key for authentication (if not set, no auth required)",
+        help="API key for authentication (overrides VLLM_MLX_API_KEY)",
     )
     serve_parser.add_argument(
         "--rate-limit",
