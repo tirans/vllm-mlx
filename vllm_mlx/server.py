@@ -333,9 +333,7 @@ def _supported_reasoning_efforts(engine, model_name: str) -> tuple[str, ...] | N
     return _effort_support_cache[key]
 
 
-def _reasoning_efforts_for_listing(
-    name: str, source: str | None
-) -> list[str] | None:
+def _reasoning_efforts_for_listing(name: str, source: str | None) -> list[str] | None:
     """Effort vocabulary for a /v1/models entry, from the on-disk template.
 
     File-based rather than tokenizer-based so unloaded catalog entries are
@@ -368,9 +366,9 @@ def _apply_reasoning_effort(
     vocabulary; the value passes through untouched.
     """
     ctk = chat_kwargs.get("chat_template_kwargs")
-    request_effort = request.reasoning_effort or (request.chat_template_kwargs or {}).get(
-        "reasoning_effort"
-    )
+    request_effort = request.reasoning_effort or (
+        request.chat_template_kwargs or {}
+    ).get("reasoning_effort")
     effort = request_effort or (ctk or {}).get("reasoning_effort")
     if effort is None:
         return
@@ -2761,7 +2759,9 @@ def _responses_request_to_chat_request(
             status_code=400,
             detail="Responses text.format.type='json_object' is not supported on this backend",
         )
-    reasoning_effort = request.reasoning.effort if request.reasoning is not None else None
+    reasoning_effort = (
+        request.reasoning.effort if request.reasoning is not None else None
+    )
 
     tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
     messages = _responses_input_to_chat_messages(request)
@@ -5292,9 +5292,7 @@ async def _build_chat_streaming_response(
 
     response = StreamingResponse(
         _disconnect_guard(
-            _ensure_sse_terminal(
-                stream_generator, "data: [DONE]\n\n", error_frame
-            ),
+            _ensure_sse_terminal(stream_generator, "data: [DONE]\n\n", error_frame),
             raw_request,
             cleanup=_make_release_cleanup(raw_request),
             timeout=total_timeout,

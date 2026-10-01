@@ -1899,6 +1899,7 @@ class Scheduler:
             return None
         temperature, top_p, min_p = params
         return make_sampler(temp=temperature, top_p=top_p, min_p=min_p)
+
     def _bounded_kv_size(self) -> int | None:
         """Configured KV bound, or None when there is none to apply.
 
@@ -2735,6 +2736,7 @@ class Scheduler:
                 self.batch_generator.remove([uid])
             except Exception as e:
                 logger.debug(f"[orphan_response] uid={uid} eviction failed: {e}")
+
     # How much a prompt must have grown before its cache snapshot is worth
     # re-taking. Copying the KV cache is O(context), so refreshing every turn
     # dominates prefill on long agentic conversations.

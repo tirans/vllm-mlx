@@ -1686,9 +1686,9 @@ class TestSimpleEngineConcurrency:
 
         assert isinstance(before, mx.ThreadLocalStream)
         assert observed is before, "the worker saw a different generation stream"
-        assert mlx_lm_generate.generation_stream is before, (
-            "the shared generation stream was rebound and left rebound"
-        )
+        assert (
+            mlx_lm_generate.generation_stream is before
+        ), "the shared generation stream was rebound and left rebound"
 
     @pytest.mark.anyio
     async def test_llm_stream_generate_stays_on_model_load_thread(self):
@@ -2027,9 +2027,7 @@ class TestSimpleEngineConcurrency:
 
             assert excinfo.value.code == "text_generation_busy"
             expected_id = (
-                "second-media"
-                if media_type == "video_url"
-                else "simple-mllm-text-"
+                "second-media" if media_type == "video_url" else "simple-mllm-text-"
             )
             assert f"request_id={expected_id}" in str(excinfo.value)
             assert "active=none" not in str(excinfo.value)

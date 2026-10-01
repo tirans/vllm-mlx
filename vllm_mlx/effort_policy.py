@@ -23,9 +23,7 @@ def resolve_reasoning_effort(
 ) -> EffortResolution:
     """Resolve the existing request/default policy without changing its inputs."""
     ctk = resolved_template_kwargs
-    explicit = request_effort or (request_template_kwargs or {}).get(
-        "reasoning_effort"
-    )
+    explicit = request_effort or (request_template_kwargs or {}).get("reasoning_effort")
     effort = explicit or (ctk or {}).get("reasoning_effort")
     if effort is None:
         return EffortResolution(ctk)

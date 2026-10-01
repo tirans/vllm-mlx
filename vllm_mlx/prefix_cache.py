@@ -687,9 +687,7 @@ class BlockAwarePrefixCache:
 
                 if class_ref is KVCache and len(state) == 3:
                     valid_length = int(state[2])
-                    state = tuple(
-                        tensor[..., :valid_length, :] for tensor in state[:2]
-                    )
+                    state = tuple(tensor[..., :valid_length, :] for tensor in state[:2])
 
                 seq_axis = self._cache_state_seq_axis(state)
                 if seq_axis is not None:

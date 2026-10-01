@@ -130,7 +130,9 @@ def template_from_source(source: str | None) -> str | None:
     if not root.is_dir():
         cache = Path.home() / ".cache" / "huggingface" / "hub"
         repo_dir = cache / f"models--{source.replace('/', '--')}"
-        snapshots = sorted((repo_dir / "snapshots").glob("*")) if repo_dir.is_dir() else []
+        snapshots = (
+            sorted((repo_dir / "snapshots").glob("*")) if repo_dir.is_dir() else []
+        )
         if not snapshots:
             return None
         root = snapshots[-1]
@@ -143,7 +145,9 @@ def template_from_source(source: str | None) -> str | None:
     config = root / "tokenizer_config.json"
     if config.is_file():
         try:
-            template = json.loads(config.read_text(encoding="utf-8")).get("chat_template")
+            template = json.loads(config.read_text(encoding="utf-8")).get(
+                "chat_template"
+            )
         except (OSError, ValueError):
             return None
         if isinstance(template, str) and template:

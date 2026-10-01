@@ -4782,9 +4782,7 @@ class TestChatCompletionStreamingModeSwitching:
 
         with (
             patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
-            patch(
-                "vllm_mlx.models.llm.MLXLanguageModel", _ThreadAffineFakeLLMModel
-            ),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", _ThreadAffineFakeLLMModel),
         ):
             monkeypatch.setattr(server, "_model_name", "test-model")
             monkeypatch.setattr(server, "_default_timeout", 30.0)
@@ -4951,9 +4949,7 @@ class TestChatCompletionStreamingModeSwitching:
 
         with (
             patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
-            patch(
-                "vllm_mlx.models.llm.MLXLanguageModel", _ThreadAffineFakeLLMModel
-            ),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", _ThreadAffineFakeLLMModel),
         ):
             monkeypatch.setattr(server, "_model_name", "test-model")
             monkeypatch.setattr(server, "_default_timeout", 30.0)
@@ -5046,9 +5042,7 @@ class TestChatCompletionStreamingModeSwitching:
 
         with (
             patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False),
-            patch(
-                "vllm_mlx.models.llm.MLXLanguageModel", _ThreadAffineFakeLLMModel
-            ),
+            patch("vllm_mlx.models.llm.MLXLanguageModel", _ThreadAffineFakeLLMModel),
         ):
             monkeypatch.setattr(server, "_model_name", "test-model")
             monkeypatch.setattr(server, "_default_timeout", 30.0)

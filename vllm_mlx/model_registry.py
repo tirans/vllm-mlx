@@ -802,9 +802,9 @@ class ModelManager:
                 entry_data["active_requests"] = loaded.active_requests
                 entry_data["num_running"] = engine_stats.get("num_running", 0)
                 entry_data["num_waiting"] = engine_stats.get("num_waiting", 0)
-                entry_data["generation_tps"] = engine_stats.get("batch_generator", {}).get(
-                    "generation_tps", 0
-                )
+                entry_data["generation_tps"] = engine_stats.get(
+                    "batch_generator", {}
+                ).get("generation_tps", 0)
                 # Wedge detection. num_running > 0 with generation_tps == 0 is
                 # ambiguous (a long prefill looks the same), so surface the two
                 # signals that disambiguate it: orphaned sequences decoding with

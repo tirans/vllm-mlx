@@ -880,7 +880,8 @@ class TestBlockAwarePrefixCache:
         from vllm_mlx.prefix_cache import BlockAwarePrefixCache
 
         cache = BlockAwarePrefixCache(
-            model=None, paged_cache_manager=PagedCacheManager(block_size=4, max_blocks=10)
+            model=None,
+            paged_cache_manager=PagedCacheManager(block_size=4, max_blocks=10),
         )
         layer = KVCache()
         layer.keys = mx.arange(12).reshape(1, 1, 12, 1)
@@ -910,7 +911,8 @@ class TestBlockAwarePrefixCache:
         from vllm_mlx.prefix_cache import BlockAwarePrefixCache
 
         cache = BlockAwarePrefixCache(
-            model=None, paged_cache_manager=PagedCacheManager(block_size=4, max_blocks=10)
+            model=None,
+            paged_cache_manager=PagedCacheManager(block_size=4, max_blocks=10),
         )
         layer = BatchKVCache([2])
         tokens = mx.arange(10).reshape(1, 1, 10, 1)

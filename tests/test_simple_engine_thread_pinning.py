@@ -263,9 +263,7 @@ def test_stream_done_sentinel_is_distinct(engine_module):
 
 @pytest.mark.parametrize("route", ["chat", "stream_chat", "native_video"])
 @pytest.mark.parametrize("top_p", [None, 0.37, 1.0])
-def test_mllm_chat_sampling_reaches_generation_worker(
-    engine_module, route, top_p
-):
+def test_mllm_chat_sampling_reaches_generation_worker(engine_module, route, top_p):
     """Both worker dispatch paths must retain the request's nucleus sampling."""
     from vllm_mlx.models.mllm import MLLMOutput
 
@@ -544,9 +542,9 @@ def test_restart_before_old_stream_drains_preserves_worker_ownership(
         assert (await anext(stream)).new_text == "first"
         pump = asyncio.create_task(_drain(stream))
         try:
-            assert await asyncio.to_thread(second_step_entered.wait, 2), (
-                "old worker never entered its blocked second step"
-            )
+            assert await asyncio.to_thread(
+                second_step_entered.wait, 2
+            ), "old worker never entered its blocked second step"
             old_worker = engine._generation_executor
             await asyncio.wait_for(engine.stop(), timeout=1)
             assert old_worker in engine._draining_executors
@@ -575,14 +573,18 @@ def test_restart_before_old_stream_drains_preserves_worker_ownership(
     asyncio.run(scenario())
 
     names = [name for name, _ in events]
-    assert names.index("old_close") < names.index("cache_clear") < names.index(
-        "new_load"
+    assert (
+        names.index("old_close") < names.index("cache_clear") < names.index("new_load")
     ), names
     old_thread = next(thread for name, thread in events if name == "old_step")
     assert all(
-        thread is old_thread for name, thread in events if name in {"old_close", "cache_clear"}
+        thread is old_thread
+        for name, thread in events
+        if name in {"old_close", "cache_clear"}
     )
-    assert next(thread for name, thread in events if name == "new_load") is not old_thread
+    assert (
+        next(thread for name, thread in events if name == "new_load") is not old_thread
+    )
 
 
 def test_generation_routes_keep_one_worker_until_restart(engine_module):

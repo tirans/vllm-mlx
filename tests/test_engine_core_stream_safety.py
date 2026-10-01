@@ -77,9 +77,9 @@ async def test_engine_core_no_cross_thread_stream_error(model_and_tokenizer, cap
         for r in caplog.records
         if "Stream(gpu" in r.message or "no Stream" in r.message
     ]
-    assert not stream_errors, (
-        f"scheduler logged cross-thread stream errors: {stream_errors}"
-    )
+    assert (
+        not stream_errors
+    ), f"scheduler logged cross-thread stream errors: {stream_errors}"
     assert tokens > 0, "no tokens streamed"
     assert bg is not None, (
         "batch generator was None after generation, meaning the scheduler's "
@@ -158,13 +158,13 @@ async def test_prefix_cache_hit_survives_engine_threads(model_and_tokenizer, cap
         for r in caplog.records
         if "no Stream(" in r.message or "Stream(gpu" in r.message
     ]
-    assert not stream_errors, (
-        f"a prefix-cache hit raised a cross-thread stream error: {stream_errors}"
-    )
+    assert (
+        not stream_errors
+    ), f"a prefix-cache hit raised a cross-thread stream error: {stream_errors}"
     assert streamed[1][0] > 0, f"the cache-hit request streamed no tokens: {streamed}"
-    assert streamed[1][1] != "error", (
-        f"the cache-hit request was aborted by the scheduler: {streamed}"
-    )
+    assert (
+        streamed[1][1] != "error"
+    ), f"the cache-hit request was aborted by the scheduler: {streamed}"
 
 
 def test_a_model_first_used_off_its_loading_thread_needs_materializing():

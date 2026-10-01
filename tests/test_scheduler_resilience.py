@@ -32,9 +32,7 @@ def _make_scheduler(**config_kwargs) -> Scheduler:
     tokenizer.encode = lambda x, add_special_tokens=True: list(range(len(x.split())))
     tokenizer.eos_token_id = 0
 
-    config = SchedulerConfig(
-        max_num_seqs=4, enable_prefix_cache=False, **config_kwargs
-    )
+    config = SchedulerConfig(max_num_seqs=4, enable_prefix_cache=False, **config_kwargs)
     return Scheduler(model, tokenizer, config)
 
 
@@ -77,7 +75,9 @@ class TestOrphanResponses:
         assert scheduler.orphan_response_count == 2
         # ...but the warning fires once, not once per decoded token.
         orphan_warnings = [
-            r.getMessage() for r in caplog.records if "orphan_response" in r.getMessage()
+            r.getMessage()
+            for r in caplog.records
+            if "orphan_response" in r.getMessage()
         ]
         assert len(orphan_warnings) == 1
         assert "uid=99" in orphan_warnings[0]
@@ -234,7 +234,9 @@ class TestStreamThreadRecovery:
 
     def test_stream_thread_error_does_not_escape(self):
         scheduler = _make_scheduler()
-        self._wired(scheduler, RuntimeError("There is no Stream(gpu, 8) in current thread."))
+        self._wired(
+            scheduler, RuntimeError("There is no Stream(gpu, 8) in current thread.")
+        )
 
         output = scheduler.step()  # used to raise
 
@@ -400,13 +402,13 @@ class TestMtpCompatibilityGuard:
         sched.model.mtp = MagicMock()
         return sched
 
-    def test_missing_internals_disable_mtp_instead_of_raising(
-        self, scheduler, caplog
-    ):
+    def test_missing_internals_disable_mtp_instead_of_raising(self, scheduler, caplog):
         install = MagicMock()
-        with patch("vllm_mlx.scheduler.BatchGenerator", _FakeBatchGenerator), patch(
-            "vllm_mlx.scheduler._install_mtp", install
-        ), caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+        with (
+            patch("vllm_mlx.scheduler.BatchGenerator", _FakeBatchGenerator),
+            patch("vllm_mlx.scheduler._install_mtp", install),
+            caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"),
+        ):
             bg = scheduler._create_batch_generator(SamplingParams())
 
         assert isinstance(bg, _FakeBatchGenerator)
@@ -437,9 +439,11 @@ class TestMtpCompatibilityGuard:
             bg._step = "half-applied"
             raise RuntimeError("mtp internals moved")
 
-        with patch("vllm_mlx.scheduler.BatchGenerator", _Compatible), patch(
-            "vllm_mlx.scheduler._install_mtp", _boom
-        ), caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"):
+        with (
+            patch("vllm_mlx.scheduler.BatchGenerator", _Compatible),
+            patch("vllm_mlx.scheduler._install_mtp", _boom),
+            caplog.at_level(logging.WARNING, logger="vllm_mlx.scheduler"),
+        ):
             bg = scheduler._create_batch_generator(SamplingParams())
 
         # The partial MTP rebinding is gone; the class method is back.

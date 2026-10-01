@@ -207,9 +207,7 @@ def serve_command(args):
     if api_key:
         print("  Authentication: ENABLED (API key required)")
     else:
-        print(
-            "  Authentication: DISABLED - Set VLLM_MLX_API_KEY or use --api-key"
-        )
+        print("  Authentication: DISABLED - Set VLLM_MLX_API_KEY or use --api-key")
     if args.rate_limit > 0:
         print(f"  Rate limiting: ENABLED ({args.rate_limit} req/min)")
     else:

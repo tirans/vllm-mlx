@@ -522,9 +522,7 @@ class MLLMScheduler:
                     request_id[:12],
                     exc_info=True,
                 )
-        logger.error(
-            "[mllm_loop] aborted %d request(s): %s", len(stuck), reason
-        )
+        logger.error("[mllm_loop] aborted %d request(s): %s", len(stuck), reason)
 
     def abort_request(self, request_id: str) -> bool:
         """
@@ -1135,9 +1133,7 @@ class MLLMScheduler:
                             consecutive_step_errors,
                             len(self.running),
                         )
-                        self._abort_all_in_flight(
-                            "mllm process loop is not recovering"
-                        )
+                        self._abort_all_in_flight("mllm process loop is not recovering")
                         consecutive_step_errors = 0
                 await asyncio.sleep(0.1)
             else:

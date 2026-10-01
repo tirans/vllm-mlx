@@ -988,6 +988,7 @@ class SimpleEngine(BaseEngine):
             # Load SpecPrefill draft model (small model for importance scoring)
             if self._specprefill_enabled and self._specprefill_draft_model_path:
                 try:
+
                     def load_draft_model():
                         from mlx_lm import load as mlx_lm_load
 
@@ -2022,9 +2023,7 @@ class SimpleEngine(BaseEngine):
                                 entry["prompt_tokens"] = getattr(
                                     chunk, "prompt_tokens", 0
                                 )
-                                entry["elapsed_s"] = round(
-                                    time.time() - started_at, 1
-                                )
+                                entry["elapsed_s"] = round(time.time() - started_at, 1)
 
                             yield GenerationOutput(
                                 text=accumulated_text,
@@ -2052,7 +2051,9 @@ class SimpleEngine(BaseEngine):
                                     "stream_chat close skipped: worker already down"
                                 )
                             except Exception:
-                                logger.warning("stream_chat close failed", exc_info=True)
+                                logger.warning(
+                                    "stream_chat close failed", exc_info=True
+                                )
                         self._active_requests.pop(slot_id, None)
                 return
 

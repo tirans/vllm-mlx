@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-
 _MISSING = object()
 
 
