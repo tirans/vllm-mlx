@@ -950,6 +950,9 @@ class TestMLLMBatchGeneratorMTPGuards:
         )
 
         generator = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        # __new__ bypasses the constructor that creates the thread-owned stream.
+        # This test replaces mx.stream with a no-op context manager.
+        generator._stream = None
         generator.max_kv_size = 0
         generator._stats = MLLMBatchStats()
         generator._pending_error_responses = []

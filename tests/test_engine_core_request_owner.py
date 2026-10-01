@@ -11,9 +11,36 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+_MISSING = object()
+
+
+def _restore_binding(parent, child, binding):
+    if binding is _MISSING:
+        vars(parent).pop(child, None)
+    else:
+        vars(parent)[child] = binding
+
+
+def _restore_import(name, module, parent, binding):
+    """Undo a stubbed import, including importlib's parent package binding."""
+    if module is _MISSING:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = module
+    _restore_binding(parent, name.rpartition(".")[2], binding)
+
+
 @pytest.fixture
 def engine_core_module(monkeypatch):
     """Import engine_core with lightweight substitutes for MLX-only modules."""
+    parent = importlib.import_module("vllm_mlx")
+    module_name = "vllm_mlx.engine_core"
+    original_module = sys.modules.get(module_name, _MISSING)
+    original_binding = vars(parent).get("engine_core", _MISSING)
+    dependency_bindings = {
+        child: vars(parent).get(child, _MISSING)
+        for child in ("scheduler", "model_registry")
+    }
     fake_mlx = types.ModuleType("mlx")
     fake_mx = types.ModuleType("mlx.core")
     fake_mlx.core = fake_mx
@@ -29,22 +56,28 @@ def engine_core_module(monkeypatch):
     fake_registry = types.ModuleType("vllm_mlx.model_registry")
     fake_registry.get_registry = lambda: None
 
-    fake_streams = types.ModuleType("vllm_mlx.mlx_streams")
-    fake_streams.bind_generation_streams = lambda: None
-
     monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
     monkeypatch.setitem(sys.modules, "vllm_mlx.scheduler", fake_scheduler)
     monkeypatch.setitem(sys.modules, "vllm_mlx.model_registry", fake_registry)
-    monkeypatch.setitem(sys.modules, "vllm_mlx.mlx_streams", fake_streams)
     monkeypatch.delitem(sys.modules, "vllm_mlx.engine_core", raising=False)
 
-    return importlib.import_module("vllm_mlx.engine_core")
+    module = importlib.import_module(module_name)
+    try:
+        yield module
+    finally:
+        _restore_import(module_name, original_module, parent, original_binding)
+        for child, binding in dependency_bindings.items():
+            _restore_binding(parent, child, binding)
 
 
 @pytest.fixture
 def batched_module(monkeypatch):
     """Import the batched engine without requiring a usable MLX runtime."""
+    parent = importlib.import_module("vllm_mlx.engine")
+    module_name = "vllm_mlx.engine.batched"
+    original_module = sys.modules.get(module_name, _MISSING)
+    original_binding = vars(parent).get("batched", _MISSING)
     fake_mlx = types.ModuleType("mlx")
     fake_mx = types.ModuleType("mlx.core")
     fake_mx.clear_cache = lambda: None
@@ -54,8 +87,11 @@ def batched_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
     monkeypatch.delitem(sys.modules, "vllm_mlx.engine.batched", raising=False)
 
-    module = importlib.import_module("vllm_mlx.engine.batched")
-    return module, fake_mx
+    module = importlib.import_module(module_name)
+    try:
+        yield module, fake_mx
+    finally:
+        _restore_import(module_name, original_module, parent, original_binding)
 
 
 @pytest.mark.anyio

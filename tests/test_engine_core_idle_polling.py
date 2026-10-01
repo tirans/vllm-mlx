@@ -65,7 +65,7 @@ async def test_engine_loop_uses_idle_interval_when_scheduler_is_empty(monkeypatc
 
 
 @pytest.mark.anyio
-async def test_engine_loop_wakes_promptly_for_request_added_while_parked(monkeypatch):
+async def test_engine_loop_wakes_promptly_for_request_added_while_parked():
     """A request must wake the real long-timeout idle loop before it expires."""
     from vllm_mlx.engine_core import EngineConfig, EngineCore
 
@@ -98,8 +98,6 @@ async def test_engine_loop_wakes_promptly_for_request_added_while_parked(monkeyp
             pass
 
     engine.scheduler = _WakeableScheduler()
-    monkeypatch.setattr("vllm_mlx.engine_core.bind_generation_streams", lambda: None)
-
     engine_task = asyncio.create_task(engine._engine_loop())
     await asyncio.wait_for(engine._request_event.wait_started.wait(), timeout=0.5)
 

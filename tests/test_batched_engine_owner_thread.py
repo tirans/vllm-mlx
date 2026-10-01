@@ -1,16 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """BatchedEngine must load the model on the thread that later steps it.
 
-MLX streams exist only in the thread that created them, and ``BatchGenerator``
-captures ``generation_stream`` into ``self._stream`` when it is built. So a
-model loaded on one thread cannot be stepped from another: the first batched
+MLX streams exist only in the thread that created them. A model loaded on
+one thread cannot be stepped from another: the first batched
 step raises "There is no Stream(gpu, N) in current thread".
 
-That failure does not look like a stream problem from the outside. ``EngineCore``
-catches it, falls back to stepping on the model thread, hits the same error
-there, and — because that fallback fires only once — then spins on the error.
-What an operator sees is ``running=1``, the step counter climbing into the
-millions, and not one token emitted.
+That failure can leave requests unable to make progress, so these tests pin
+the owner thread across model load, stepping, and cleanup.
 
 These tests record threads rather than touching MLX, so they run anywhere.
 Fakes follow the convention in ``test_engine_core_thread_streams.py``.
@@ -59,7 +55,7 @@ class _FakeScheduler:
         pass
 
 
-def _bare_engine_core(monkeypatch, worker=None):
+def _bare_engine_core(worker=None):
     from vllm_mlx.engine_core import EngineConfig, EngineCore
 
     engine = object.__new__(EngineCore)
@@ -72,9 +68,6 @@ def _bare_engine_core(monkeypatch, worker=None):
     if worker is not None:
         engine._external_generation_worker = worker
     engine.scheduler = _FakeScheduler(engine)
-    monkeypatch.setattr(
-        "vllm_mlx.engine_core.bind_generation_streams", lambda *a, **k: None
-    )
     return engine
 
 
@@ -125,7 +118,7 @@ def test_worker_thread_is_named_for_the_engine_loop():
 
 
 @pytest.mark.anyio
-async def test_model_load_and_stepping_share_one_thread(monkeypatch):
+async def test_model_load_and_stepping_share_one_thread():
     """The regression: load on thread A, step on thread B.
 
     Loading inline on the event loop (issue #407) did not fix this, because
@@ -158,7 +151,7 @@ async def test_model_load_and_stepping_share_one_thread(monkeypatch):
     assert started_llm, "start() never reached engine startup"
 
     # Step exactly as the engine loop does: on the worker start() loaded on.
-    core = _bare_engine_core(monkeypatch, worker=engine._generation_worker())
+    core = _bare_engine_core(worker=engine._generation_worker())
     await asyncio.wait_for(core._engine_loop(), timeout=5)
 
     engine._generation_executor.shutdown(wait=True)
@@ -232,9 +225,6 @@ async def test_mllm_load_and_step_share_the_event_loop_thread(monkeypatch):
             scheduler._running = False
 
     scheduler.step = step
-    monkeypatch.setattr(
-        "vllm_mlx.mllm_scheduler.bind_generation_streams", lambda *a, **k: None
-    )
     await asyncio.wait_for(scheduler._process_loop(), timeout=5)
 
     assert load_threads and step_threads
@@ -283,7 +273,7 @@ async def test_residency_manager_honours_the_per_path_load_thread():
 
 
 @pytest.mark.anyio
-async def test_supplied_worker_outlives_the_engine_loop(monkeypatch):
+async def test_supplied_worker_outlives_the_engine_loop():
     """The caller's worker owns the loaded model; the loop must not close it.
 
     Shutting it down here would take the model's streams with it while
@@ -291,7 +281,7 @@ async def test_supplied_worker_outlives_the_engine_loop(monkeypatch):
     executor.
     """
     worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
-    core = _bare_engine_core(monkeypatch, worker=worker)
+    core = _bare_engine_core(worker=worker)
 
     await asyncio.wait_for(core._engine_loop(), timeout=5)
 
@@ -303,7 +293,7 @@ async def test_supplied_worker_outlives_the_engine_loop(monkeypatch):
 async def test_engine_core_stop_cleanup_stays_on_supplied_worker(monkeypatch):
     """Cancellation, its safety net, and repeated stop keep one owner."""
     worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
-    core = _bare_engine_core(monkeypatch, worker=worker)
+    core = _bare_engine_core(worker=worker)
     core._running = False
     core._task = None
     core._request_event = None
@@ -336,9 +326,9 @@ async def test_engine_core_stop_cleanup_stays_on_supplied_worker(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_loop_still_cleans_up_a_worker_it_created(monkeypatch):
+async def test_loop_still_cleans_up_a_worker_it_created():
     """Without a supplied worker the loop owns its pool and must retire it."""
-    core = _bare_engine_core(monkeypatch, worker=None)
+    core = _bare_engine_core(worker=None)
 
     await asyncio.wait_for(core._engine_loop(), timeout=5)
 
@@ -356,7 +346,7 @@ async def test_loop_still_cleans_up_a_worker_it_created(monkeypatch):
 async def test_supplied_model_worker_is_not_replaced_by_stream_fallback(monkeypatch):
     """A caller-supplied worker owns the model and cannot be abandoned."""
     worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-core")
-    core = _bare_engine_core(monkeypatch, worker=worker)
+    core = _bare_engine_core(worker=worker)
 
     class StreamErrorScheduler(_FakeScheduler):
         def step(self):

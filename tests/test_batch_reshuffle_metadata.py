@@ -290,22 +290,18 @@ class TestReshuffleEvaluatesMetadata:
 
         ``MLLMBatchGenerator.next()`` runs every decode step — including the
         ``batch.filter()``/``batch.extend()`` reshuffles — under
-        ``with mx.stream(MLLMBatchGenerator._stream)``, a dedicated
-        generation stream created once per process.  This test replicates
-        that exact context (same class attribute, same construction, same
-        context manager) around sustained churn and asserts that after each
+        ``with mx.stream(self._stream)``, where the stream belongs to the
+        generator and its constructing thread. This test uses that context
+        around sustained churn and asserts that after each
         cycle's normal ``y``/keys/values evaluation no cache array carries
         pending lazy work, and the surviving metadata values stay correct.
         No model forward pass is needed: the leak is a property of the
         reshuffle graph, not of inference."""
         import mlx.core as mx
 
-        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
-
         _assert_instrument_works()
-        if MLLMBatchGenerator._stream is None:
-            MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
-        with mx.stream(MLLMBatchGenerator._stream):
+        stream = mx.new_stream(mx.default_device())
+        with mx.stream(stream):
             resident = _make_live_batch(3)
             for cycle in range(20):
                 incoming = _make_live_batch(1)
@@ -381,10 +377,8 @@ class TestGeneratorPathChurn:
             MLLMBatchStats,
         )
 
-        if MLLMBatchGenerator._stream is None:
-            MLLMBatchGenerator._stream = mx.new_stream(mx.default_device())
-
         gen = MLLMBatchGenerator.__new__(MLLMBatchGenerator)
+        gen._stream = mx.new_stream(mx.default_device())
         gen.active_batch = None
         gen.unprocessed_requests = []
         gen._pending_error_responses = []

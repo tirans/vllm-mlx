@@ -1942,13 +1942,21 @@ class TestSimpleEngineConcurrency:
         assert outputs[-1].text == "drafted"
 
     @pytest.mark.anyio
-    async def test_mllm_media_stream_uses_fail_fast_admission(self):
-        """A concurrent media request must receive EngineBusy instead of queueing."""
+    @pytest.mark.parametrize("media_type", ["image_url", "video_url"])
+    async def test_mllm_media_uses_fail_fast_admission(self, media_type):
+        """Image and native-video routes reject concurrency under fail-fast."""
         from vllm_mlx.engine.base import EngineBusy
         from vllm_mlx.engine.simple import SimpleEngine
 
         class FakeMllmModel:
+            _video_native = media_type == "video_url"
+
+            def _collect_video_inputs(self, messages):
+                return ["test-video"]
+
             def stream_chat(self, **_kwargs):
+                first_started.set()
+                assert release_first.wait(timeout=5)
                 yield SimpleNamespace(
                     text="first",
                     finish_reason=None,
@@ -1961,14 +1969,19 @@ class TestSimpleEngineConcurrency:
                 )
 
         def media_messages(label):
+            url = (
+                "test-video"
+                if media_type == "video_url"
+                else "data:image/png;base64,AAAA"
+            )
             return [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": label},
                         {
-                            "type": "image_url",
-                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                            "type": media_type,
+                            media_type: {"url": url},
                         },
                     ],
                 }
@@ -1980,8 +1993,8 @@ class TestSimpleEngineConcurrency:
         engine._text_model = MagicMock()
         engine._model = FakeMllmModel()
 
-        first_started = asyncio.Event()
-        release_first = asyncio.Event()
+        first_started = threading.Event()
+        release_first = threading.Event()
 
         async def consume_first():
             outputs = []
@@ -1990,13 +2003,10 @@ class TestSimpleEngineConcurrency:
                 request_id="first-media",
             ):
                 outputs.append(output)
-                if len(outputs) == 1:
-                    first_started.set()
-                    await release_first.wait()
             return outputs
 
         first_task = asyncio.create_task(consume_first())
-        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        assert await asyncio.to_thread(first_started.wait, 1.0)
 
         try:
             with pytest.raises(EngineBusy) as excinfo:
@@ -2009,7 +2019,12 @@ class TestSimpleEngineConcurrency:
                 ]
 
             assert excinfo.value.code == "text_generation_busy"
-            assert "request_id=second-media" in str(excinfo.value)
+            expected_id = (
+                "second-media"
+                if media_type == "video_url"
+                else "simple-mllm-text-"
+            )
+            assert f"request_id={expected_id}" in str(excinfo.value)
             assert "active=none" not in str(excinfo.value)
             assert engine._generation_busy_rejections == 1
         finally:
