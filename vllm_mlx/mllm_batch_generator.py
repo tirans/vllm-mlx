@@ -16,6 +16,7 @@ Architecture:
 3. Language model generation is batched using BatchKVCache (like LLM batching)
 """
 
+import inspect
 import logging
 import math
 import os
@@ -1179,8 +1180,18 @@ class MLLMBatchGenerator:
         if not callable(from_state):
             raise TypeError(f"Unsupported prefix cache layer: {type(cache).__name__}")
         state = cls._copy_cache_state(cache.state)
-        meta_state = cls._copy_cache_state(cache.meta_state)
-        copied = from_state(state, meta_state)
+        meta_state = cls._copy_cache_state(getattr(cache, "meta_state", None))
+        if "meta_state" in inspect.signature(from_state).parameters:
+            copied = from_state(state, meta_state)
+        else:
+            copied = from_state(state)
+        from mlx_lm.models.cache import ArraysCache as LMArrayCache
+        from mlx_vlm.models.cache import ArraysCache as VLMArrayCache
+
+        if isinstance(cache, (LMArrayCache, VLMArrayCache)):
+            # Older LM and VLM serializers omit these effective batch fields.
+            copied.left_padding = cache.left_padding
+            copied.lengths = cache.lengths
         if "step" in getattr(cache, "__dict__", {}):
             copied.step = cache.step
         return copied

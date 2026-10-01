@@ -109,6 +109,86 @@ class TestMLLMPromptCacheEval:
         eval_mock.assert_called_once_with(kv_keys, kv_values, state)
 
 
+class TestMLLMPrefixCacheCopy:
+    def test_legacy_state_and_metadata_are_isolated(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        array = object()
+
+        class LegacyCache:
+            def __init__(self, state, meta_state):
+                self.state = state
+                self.meta_state = meta_state
+
+            @classmethod
+            def from_state(cls, state, meta_state):
+                return cls(state, meta_state)
+
+        source = LegacyCache({"layers": [[array]]}, {"offsets": [3]})
+        copied = MLLMBatchGenerator._copy_prefix_cache([source])
+
+        assert copied is not None
+        clone = copied[0]
+        assert clone is not source
+        assert clone.state["layers"][0] is not source.state["layers"][0]
+        assert clone.state["layers"][0][0] is array
+        assert clone.meta_state is not source.meta_state
+        clone.state["layers"][0].append(object())
+        clone.meta_state["offsets"].append(4)
+        assert source.state["layers"] == [[array]]
+        assert source.meta_state == {"offsets": [3]}
+
+    def test_state_only_cache_preserves_embedded_metadata_without_aliases(self):
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        array = object()
+
+        class StateOnlyCache:
+            def __init__(self, state):
+                self.state = state
+
+            @classmethod
+            def from_state(cls, state):
+                return cls(state)
+
+        source = StateOnlyCache({"layers": [[array]], "offsets": [3]})
+        copied = MLLMBatchGenerator._copy_prefix_cache([source])
+
+        assert copied is not None
+        clone = copied[0]
+        assert clone is not source
+        assert clone.state["layers"][0] is not source.state["layers"][0]
+        assert clone.state["layers"][0][0] is array
+        assert clone.state["offsets"] == [3]
+        clone.state["layers"][0].append(object())
+        clone.state["offsets"].append(4)
+        assert source.state == {"layers": [[array]], "offsets": [3]}
+
+    @pytest.mark.parametrize("library", ["mlx_lm", "mlx_vlm"])
+    def test_real_arrays_cache_reuse_has_independent_slot_container(self, library):
+        from importlib import import_module
+
+        from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
+
+        ArraysCache = import_module(f"{library}.models.cache").ArraysCache
+        array = mx.array([[1, 2]])
+        source = ArraysCache(2)
+        source[0] = array
+        source.left_padding = mx.array([1])
+        source.lengths = mx.array([2])
+        copied = MLLMBatchGenerator._copy_prefix_cache([source])
+
+        assert copied is not None
+        clone = copied[0]
+        assert type(clone) is type(source)
+        assert clone.cache is not source.cache
+        assert clone[0] is array
+        assert clone.left_padding is source.left_padding
+        assert clone.lengths is source.lengths
+        clone[1] = mx.array([[3, 4]])
+        assert source[1] is None
+
+
 class TestMLLMPendingRemovals:
     def test_process_pending_removals_atomic_swap_preserves_new_enqueues(self):
         from vllm_mlx.mllm_batch_generator import MLLMBatchGenerator
