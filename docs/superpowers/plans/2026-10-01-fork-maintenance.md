@@ -21,6 +21,89 @@ candidate is `1036ca3`; publication of `ac58df4` to `origin/main` was verified
 with `git ls-remote`. Hosted CI was queued/running at publication and its
 results remain pending. This completion covers implementation and local QA.
 
+## Hosted CI follow-up (2026-10-01)
+
+Status: **LOCAL ACCEPTANCE COMPLETE** at `a3dd01a`; hosted validation pending.
+This follow-up began after publication of `952a609`. The earlier local
+acceptance remains a dated result for its installed dependencies; it does not
+clear the newly observed hosted failures.
+
+- Fork workflow run `36868075065`: Linux policy jobs passed on Python 3.10 and
+  3.13. Apple Python 3.11 reported three fixture failures; Python 3.13 was
+  cancelled by the matrix failure policy.
+- Existing CI run `36868075058`: Black reported 14 fork-modified paths; Linux
+  cache tests reported seven missing-stub-method failures; Apple tests reported
+  13 failures involving cache restoration, prefill compatibility, cache metadata
+  and test doubles.
+- Hosted dependencies included MLX 0.32.3, MLX-LM 0.32.0 and MLX-VLM 0.7.4,
+  newer than the local baseline. Preserve support for the existing environment
+  while repairing demonstrated incompatibilities with the hosted versions.
+
+| Work | Owner | Boundary | Acceptance |
+| --- | --- | --- | --- |
+| Tokenizer/test-double repairs | DevOps, GPT-6 Sol/high | Simple engine and scheduler resilience tests | Three hosted fork failures reproduced and repaired |
+| Cache/prefill compatibility | Developer, GPT-6 Sol/high | Scheduler, prefix cache, memory cache and affected tests | Old/new interfaces covered without suppressing errors |
+| Formatting | Integration owner | Explicit 14 reported paths plus two newly edited files, separate commit | Black 26.5.1 passes; all 16 syntax trees unchanged |
+| Independent review | Reviewer, GPT-6 Astra/high | Completed repair packets and final diff | No unresolved correctness findings |
+| Validation/publication | QA/owner | Serialized GPU checks, isolated environments, normal fork push | Both suite orders, hosted workflows, redacted scan and remote verification |
+
+Retain original failure logs outside Git. Do not downgrade dependencies, weaken
+CI gates, broadly format directories, or change the shared serving environment.
+Repository security settings and shared services remain outside this repair.
+
+### Follow-up repair evidence
+
+- Tokenizer test doubles now implement the methods used by MLX-LM 0.32.
+  Optimized detokenizer coverage checks the public factory and independent state.
+- Cache restoration supports both constructor signatures. A review caught raw
+  BatchKVCache capacity being mistaken for valid length; real spare-capacity and
+  left-padding cases reproduced it before the correction. Restoration now uses
+  the dependency's extraction method and rejects multirow snapshots in this path.
+- Cache accounting avoids pricing metadata arrays twice. Multimodal prefix copies
+  retain mutable-container independence and effective padding/length metadata.
+- SSD cache records retain legacy reads. Metadata-bearing ArraysCache records use
+  the distinct `ArraysCacheV2` layer tag; older readers reject these records rather
+  than silently discard metadata. Real writer/manifest/promotion/restore tests
+  passed on both MLX-LM versions.
+- Independently reviewed repair packets are integrated through `a3dd01a`.
+  Formatting commit `8977cd6` changes only formatting, verified by equal Python
+  syntax trees for all 16 paths. Global Black checks all 287 Python files; Ruff
+  and whitespace checks passed. No dependency constraints or CI gates changed.
+
+The first combined run at `8977cd6` found four additional new-stack failures in
+both orders (3614 passed, 4 failed, 24 skipped, 27 deselected). Those failures
+led to the tokenizer/SSD follow-ups. Logs remain in
+`/private/tmp/vllm-mlx-ci-final-new/`; these are failing evidence, not acceptance.
+An isolated Darwin environment without MLX reproduced the Linux stub failures,
+then passed the actual unit command (1721 passed, 19 skipped, 20 deselected) and
+separate stub command (6 passed). This checks the dependency boundary locally;
+it does not substitute for hosted Linux results. Evidence is under
+`/private/tmp/vllm-mlx-ci-no-mlx-evidence/`.
+
+Final QA at `a3dd01a2665dfbc0999a65a43fa8fc72b2248693` passed on both local
+MLX-LM 0.31.3 and isolated MLX-LM 0.32.0/MLX 0.32.3/MLX-VLM 0.7.4. Each
+stack passed both full file orders: **3619 passed, 24 skipped, 27 deselected**,
+exit 0. Times: old forward/reverse 41.19/40.33 seconds; new 42.02/40.46.
+Logs, JUnit and SHA/command receipts are under
+`/private/tmp/vllm-mlx-ci-final2-{old,new}/`. The new environment overlays exact
+MLX packages on existing other dependencies; it is not a full hosted-image clone.
+The 24 skips retain the previously documented optional/model/live conditions.
+
+The actual fork workflow blocks also passed at this SHA: policy 14; Apple
+fixtures 323 without skips; fresh stream checks 5 without skips. Preflight
+reported MLX 0.32.3 and MLX-LM 0.32.0. Its separate `pip show` command was
+NOT_RUN locally because the isolated environment lacks pip. Logs are under
+`/private/tmp/vllm-mlx-ci-final2-workflow/`. The actual no-MLX CI unit script
+passed again: 1721 passed, 19 skipped, 20 deselected; separate stub 6 passed.
+Final CPU logs are `final2-workflow-{unit,stub}.log` under the no-MLX evidence
+path above. These are Darwin CPU checks, not hosted Linux matrix results.
+
+Independent task reviews and the combined review approved the final source.
+The existing independent reviewer performed the combined review because a fresh
+reviewer thread was unavailable. GPU runs were serialized; no shared service was
+restarted. The shared dependency environment was not upgraded. Hosted reruns
+remain pending until the repair commits are published and GitHub completes them.
+
 ## Global constraints
 
 - Preserve public behavior and published history; no force push.
