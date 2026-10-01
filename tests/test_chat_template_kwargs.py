@@ -17,6 +17,16 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture
+def supported_effort_vocabulary(monkeypatch):
+    # Forwarding tests do not need tokenizer introspection or a shared cache entry.
+    monkeypatch.setattr(
+        srv,
+        "_supported_reasoning_efforts",
+        lambda engine, model_name: ("low", "medium", "xhigh"),
+    )
+
+
 def test_chat_completion_request_preserves_chat_template_kwargs():
     request = srv.ChatCompletionRequest(
         model="test-model",
@@ -75,7 +85,9 @@ def test_batched_engine_mllm_falls_back_to_tokenizer_when_processor_has_no_templ
         tokenizer.apply_chat_template.assert_called_once()
 
 
-def test_chat_completion_endpoint_forwards_chat_template_kwargs():
+def test_chat_completion_endpoint_forwards_chat_template_kwargs(
+    supported_effort_vocabulary,
+):
     captured = {}
 
     class FakeEngine:
@@ -122,15 +134,31 @@ def test_chat_completion_endpoint_forwards_chat_template_kwargs():
 
 
 @pytest.mark.parametrize(
-    ("request_effort", "request_kwargs", "expected_effort"),
+    ("request_effort", "request_kwargs", "expected_effort", "request_only"),
     [
-        (None, None, "low"),
-        ("medium", None, "medium"),
-        ("medium", {"reasoning_effort": "high"}, "high"),
+        (None, None, "low", {}),
+        ("medium", None, "medium", {}),
+        (
+            None,
+            {"reasoning_effort": "xhigh", "request_only": True},
+            "xhigh",
+            {"request_only": True},
+        ),
+        (
+            "medium",
+            {"reasoning_effort": "xhigh", "request_only": True},
+            "medium",
+            {"request_only": True},
+        ),
     ],
 )
 def test_chat_completion_preparation_resolves_reasoning_effort_precedence(
-    monkeypatch, request_effort, request_kwargs, expected_effort
+    monkeypatch,
+    supported_effort_vocabulary,
+    request_effort,
+    request_kwargs,
+    expected_effort,
+    request_only,
 ):
     monkeypatch.setattr(
         srv,
@@ -150,8 +178,26 @@ def test_chat_completion_preparation_resolves_reasoning_effort_precedence(
     assert prepared.chat_kwargs["chat_template_kwargs"] == {
         "reasoning_effort": expected_effort,
         "server_only": True,
-        **({} if request_kwargs is None else request_kwargs),
+        **request_only,
     }
+
+
+def test_chat_completion_preparation_rejects_unknown_effort(
+    monkeypatch, supported_effort_vocabulary
+):
+    monkeypatch.setattr(srv, "_default_chat_template_kwargs", None)
+    request = srv.ChatCompletionRequest(
+        model="test-model",
+        messages=[srv.Message(role="user", content="Hello")],
+        chat_template_kwargs={"reasoning_effort": "high", "request_only": True},
+    )
+    engine = SimpleNamespace(is_mllm=False, preserve_native_tool_format=False)
+
+    with pytest.raises(srv.HTTPException) as exc:
+        srv._prepare_chat_completion_invocation(engine, request, 8)
+
+    assert exc.value.status_code == 400
+    assert "supported values: low, medium, xhigh" in exc.value.detail
 
 
 def test_chat_completion_endpoint_applies_server_default_chat_template_kwargs():

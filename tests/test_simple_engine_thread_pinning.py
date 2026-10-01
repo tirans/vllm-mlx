@@ -76,11 +76,6 @@ def _install_mlx_stubs() -> None:
 _install_mlx_stubs()
 
 
-def _thread_label(thread: threading.Thread | None) -> str:
-    """Readable identity for failure messages; None means never bound."""
-    return "—" if thread is None else f"{thread.name}/{thread.ident}"
-
-
 class _Chunk:
     def __init__(self, text: str, finish_reason: str | None = None) -> None:
         self.text = text
@@ -157,9 +152,6 @@ def _make_engine(engine_module, model=None):
 
     engine = object.__new__(engine_module.SimpleEngine)
     engine._generation_executor = None
-    engine._generation_streams_bound = False
-    engine._pre_bind_generation_streams = None
-    engine._worker_generation_stream = None
     engine._stopping = False
     engine._draining_executors = []
     engine._generation_users = 0
@@ -269,7 +261,7 @@ def test_stream_done_sentinel_is_distinct(engine_module):
 @pytest.mark.parametrize("route", ["chat", "stream_chat", "native_video"])
 @pytest.mark.parametrize("top_p", [None, 0.37, 1.0])
 def test_mllm_chat_sampling_reaches_generation_worker(
-    engine_module, monkeypatch, route, top_p
+    engine_module, route, top_p
 ):
     """Both worker dispatch paths must retain the request's nucleus sampling."""
     from vllm_mlx.models.mllm import MLLMOutput
@@ -295,7 +287,6 @@ def test_mllm_chat_sampling_reaches_generation_worker(
     engine._loaded = True
     engine._model = SamplingModel()
     engine._text_model_initialization_attempted = True
-    monkeypatch.setattr(engine, "_bind_generation_streams_once", lambda: None)
     media_type = "video_url" if route == "native_video" else "image_url"
     messages = [
         {
@@ -509,137 +500,115 @@ def test_lifecycle_prepare_runs_on_the_engine_generation_worker(engine_module):
     ), f"model load landed on {loaded_on}, generation runs on {worker_thread}"
 
 
-def test_restart_after_stop_mid_stream_uses_a_fresh_worker(engine_module):
-    """stop() then start() must hand generation a new, exclusively-owned thread.
+def test_restart_before_old_stream_drains_preserves_worker_ownership(
+    engine_module, monkeypatch
+):
+    """Restart waits for old close and cache cleanup before loading on a new worker."""
+    events: list[tuple[str, threading.Thread]] = []
+    second_step_entered = threading.Event()
+    release_second_step = threading.Event()
 
-    The detached worker may still be finishing a generation, and two threads
-    inside Metal at once is what the pinning is there to prevent — so the new
-    thread has to join the old one before it loads anything.
-    """
-    threads: dict[str, list[str]] = {}
-    thread_instances: set[threading.Thread] = set()
-    gate = threading.Event()
-    slow = _ThreadRecordingModel(
-        threads,
-        chunks=64,
-        chunk_gate=gate,
-        thread_instances=thread_instances,
-    )
-    engine = _make_engine(engine_module, slow)
+    def record(name: str) -> None:
+        events.append((name, threading.current_thread()))
+
+    class SlowModel(_ThreadRecordingModel):
+        def stream_generate(self, **kwargs):
+            try:
+                record("old_step")
+                yield _Chunk("first")
+                second_step_entered.set()
+                assert release_second_step.wait(timeout=5), "old step was not released"
+                record("old_step")
+                yield _Chunk("second", "stop")
+            finally:
+                record("old_close")
+
+    engine = engine_module.SimpleEngine("test-model")
+    engine._loaded = True
+    engine._model = SlowModel({})
+    engine.STOP_DRAIN_TIMEOUT_S = 0.05
+
+    def prepare_fresh_model() -> None:
+        record("new_load")
+        engine._model = _ThreadRecordingModel({})
+
+    monkeypatch.setattr(engine, "prepare_for_start", prepare_fresh_model)
+    monkeypatch.setattr(engine, "_probe_system_kv_cache_support", lambda *a: False)
+    monkeypatch.setattr(engine_module.mx, "clear_cache", lambda: record("cache_clear"))
 
     async def scenario() -> None:
-        stream = engine._stream_generate_impl(prompt="hi", max_tokens=64)
-        gate.set()
-        await stream.__anext__()
-        gate.clear()
-        pump = asyncio.ensure_future(_drain(stream))
-        await asyncio.sleep(0)
+        stream = engine._stream_generate_impl(prompt="hi", max_tokens=4)
+        assert (await anext(stream)).new_text == "first"
+        pump = asyncio.create_task(_drain(stream))
+        try:
+            assert await asyncio.to_thread(second_step_entered.wait, 2), (
+                "old worker never entered its blocked second step"
+            )
+            old_worker = engine._generation_executor
+            await asyncio.wait_for(engine.stop(), timeout=1)
+            assert old_worker in engine._draining_executors
 
-        engine.STOP_DRAIN_TIMEOUT_S = 0.2
-        await asyncio.wait_for(engine.stop(), timeout=1.0)
-        assert engine._draining_executors, "a busy worker must be parked, not lost"
-        detached = engine._draining_executors[0]
+            restart = asyncio.create_task(engine.start())
+            await asyncio.sleep(0)
+            assert not restart.done(), "restart crossed an active old iterator"
+            assert not any(name == "new_load" for name, _ in events)
 
-        gate.set()
-        await asyncio.wait_for(pump, timeout=5.0)
-
-        # Restart: a new worker, whose first job is to wait the old one out.
-        engine._stopping = False
-        engine._loaded = True
-        fresh = _ThreadRecordingModel(threads, thread_instances=thread_instances)
-        engine._model = fresh
-        worker = engine._generation_worker()
-        assert worker is not detached, "stop() must not hand back the dead worker"
-        assert not engine._draining_executors, "the parked worker must be claimed"
-
-        async for _ in engine._stream_generate_impl(prompt="again", max_tokens=8):
-            pass
-        engine._generation_executor.shutdown(wait=True)
+            release_second_step.set()
+            await asyncio.wait_for(pump, timeout=5)
+            await asyncio.wait_for(restart, timeout=5)
+            assert engine._generation_executor is not old_worker
+            async for _ in engine._stream_generate_impl(prompt="again", max_tokens=4):
+                pass
+        finally:
+            release_second_step.set()
+            if not pump.done():
+                await asyncio.wait_for(pump, timeout=5)
+            if engine._generation_executor is not None:
+                engine._generation_executor.shutdown(wait=True)
 
     async def _drain(stream) -> list:
         return [chunk async for chunk in stream]
 
     asyncio.run(scenario())
 
-    names = sorted(set(threads["stream_generate"]))
-    assert len(thread_instances) == 2, f"restart must use a fresh thread, saw {names}"
-    assert not any(t.startswith("MainThread") for t in names)
+    names = [name for name, _ in events]
+    assert names.index("old_close") < names.index("cache_clear") < names.index(
+        "new_load"
+    ), names
+    old_thread = next(thread for name, thread in events if name == "old_step")
+    assert all(
+        thread is old_thread for name, thread in events if name in {"old_close", "cache_clear"}
+    )
+    assert next(thread for name, thread in events if name == "new_load") is not old_thread
 
 
-def test_new_worker_never_binds_the_retired_workers_stream(engine_module, monkeypatch):
-    """A restarted engine must allocate its own stream, not inherit the old one.
-
-    An MLX stream exists only in the thread that created it, so pointing a fresh
-    worker at the retired worker's stream puts that thread's default on a stream
-    it cannot enter, and every array it builds afterwards dies with "There is no
-    Stream(gpu, N) in current thread".
-
-    The engine is driven through its real stop/restart path; the binding helper
-    is faked so the check runs on machines without MLX, matching the rest of
-    this module.
-    """
-    # Keyed by Thread object, not ident: this test retires a worker and starts
-    # another, which is exactly the window in which the OS may hand the new
-    # thread the dead one's ident. Comparing idents would then read a
-    # cross-thread bind as same-thread and silently stop catching the
-    # regression. Same reason as 36deafe1 for the neighbouring test.
-    owner_of: dict[int, threading.Thread] = {}
-    cross_thread: list[tuple[int, str, str]] = []
-    issued = [0]
-
-    def fake_bind(stream=None):
-        me = threading.current_thread()
-        if stream is not None:
-            owner = owner_of.get(stream)
-            if owner is not me:
-                cross_thread.append((stream, _thread_label(owner), _thread_label(me)))
-            return stream
-        issued[0] += 1
-        owner_of[issued[0]] = me
-        return issued[0]
-
-    monkeypatch.setattr(engine_module, "_bind_worker_generation_streams", fake_bind)
-
+def test_generation_routes_keep_one_worker_until_restart(engine_module):
+    """Repeated routes share their worker; a stopped engine creates a new one."""
     threads: dict[str, list[str]] = {}
-    engine = _make_engine(engine_module, _ThreadRecordingModel(threads))
+    owners: set[threading.Thread] = set()
+    first_model = _ThreadRecordingModel(threads, thread_instances=owners)
+    engine = _make_engine(engine_module, first_model)
 
     async def scenario() -> None:
-        async for _ in engine._stream_generate_impl(prompt="hi", max_tokens=4):
-            pass
-        first_stream = engine._worker_generation_stream
-        assert first_stream is not None, "the first generation must bind a stream"
+        first_worker = engine._generation_worker()
+        for prompt in ("hi", "more"):
+            async for _ in engine._stream_generate_impl(prompt=prompt, max_tokens=4):
+                pass
+        assert len(owners) == 1, "routes on one engine used different workers"
 
-        # A second route on the same worker re-points at the stream already
-        # allocated there. Allocating per request would leak one stream per
-        # request, which is how the "Stream(gpu, 32)" numbering got that high.
-        async for _ in engine._stream_generate_impl(prompt="more", max_tokens=4):
-            pass
-        assert engine._worker_generation_stream == first_stream
-        assert issued[0] == 1, f"one stream per worker, allocated {issued[0]}"
-
-        engine.STOP_DRAIN_TIMEOUT_S = 0.2
-        await asyncio.wait_for(engine.stop(), timeout=2.0)
-        assert (
-            engine._worker_generation_stream is None
-        ), "the retired worker's stream must not survive stop()"
-
+        await engine.stop()
+        assert engine._generation_executor is None
         engine._stopping = False
         engine._loaded = True
-        engine._model = _ThreadRecordingModel(threads)
+        engine._model = _ThreadRecordingModel(threads, thread_instances=owners)
+        second_worker = engine._generation_worker()
+        assert second_worker is not first_worker
         async for _ in engine._stream_generate_impl(prompt="again", max_tokens=4):
             pass
-        assert engine._worker_generation_stream != first_stream, (
-            "the fresh worker must allocate its own stream, "
-            f"but reused {first_stream}"
-        )
-        engine._generation_executor.shutdown(wait=True)
+        second_worker.shutdown(wait=True)
 
     asyncio.run(scenario())
-
-    assert not cross_thread, (
-        "a thread bound a stream created by another thread: "
-        f"{cross_thread} (stream, owner, binder)"
-    )
+    assert len(owners) == 2, "restart reused the retired worker thread"
 
 
 @pytest.fixture()

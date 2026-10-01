@@ -1975,6 +1975,7 @@ class TestSimpleEngineConcurrency:
             ]
 
         engine = SimpleEngine("test-model", force_mllm=True, mtp=False)
+        engine._generation_lock_admission = "fail_fast"
         engine._loaded = True
         engine._text_model = MagicMock()
         engine._model = FakeMllmModel()

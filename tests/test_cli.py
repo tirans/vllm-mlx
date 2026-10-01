@@ -191,6 +191,41 @@ def test_serve_command_propagates_all_sampling_defaults(monkeypatch):
     assert loaded["kwargs"]["specprefill_backbone_pct"] == 0.25
 
 
+@pytest.mark.parametrize(
+    ("environment_key", "argument_key", "expected_key"),
+    [
+        ("environment-placeholder", None, "environment-placeholder"),
+        ("environment-placeholder", "argument-placeholder", "argument-placeholder"),
+        (None, None, None),
+    ],
+)
+def test_serve_command_api_key_precedence(
+    monkeypatch, capsys, environment_key, argument_key, expected_key
+):
+    from vllm_mlx import cli, server
+    from vllm_mlx.utils import download
+
+    if environment_key is None:
+        monkeypatch.delenv("VLLM_MLX_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_MLX_API_KEY", environment_key)
+    monkeypatch.setattr(server, "_api_key", None)
+    monkeypatch.setattr(
+        download, "ensure_model_downloaded", lambda *args, **kwargs: "local-test-model"
+    )
+    monkeypatch.setattr(server, "load_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr("uvicorn.run", lambda *args, **kwargs: None)
+
+    cli.serve_command(_serve_args(api_key=argument_key))
+
+    assert server._api_key == expected_key
+    summary = capsys.readouterr().out
+    expected_mode = "ENABLED" if expected_key else "DISABLED"
+    assert f"Authentication: {expected_mode}" in summary
+    assert "environment-placeholder" not in summary
+    assert "argument-placeholder" not in summary
+
+
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_serve_parser_rejects_nonpositive_prefill_step_size(value, capsys):
     from vllm_mlx.cli import create_parser
