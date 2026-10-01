@@ -2164,18 +2164,21 @@ class Scheduler:
                     # BatchKVCache doesn't inherit from KVCache, so
                     # _merge_caches can't handle it. Convert to KVCache
                     # (safe because mid-prefill save is always batch_size=1).
-                    from mlx_lm.models.cache import (
-                        BatchKVCache as _BatchKVCache,
-                        KVCache as _KVCache,
-                    )
+                    from mlx_lm.models.cache import BatchKVCache as _BatchKVCache
 
                     if cache_cls is _BatchKVCache:
-                        # BatchKVCache.state = (keys, values, offset, left_padding)
-                        keys, values = state[0], state[1]
-                        cache = _KVCache()
-                        cache.keys = keys
-                        cache.values = values
-                        cache.offset = keys.shape[2]
+                        # The batch-one snapshot may have left padding and
+                        # spare capacity (mlx-lm 0.32 exposes raw keys in
+                        # state). Its extract method applies both the valid
+                        # index and padding before returning a plain KVCache.
+                        if state[0].shape[0] != 1:
+                            return None
+                        parameters = inspect.signature(cache_cls.from_state).parameters
+                        if "meta_state" in parameters:
+                            batch_cache = cache_cls.from_state(state, meta_state)
+                        else:
+                            batch_cache = cache_cls.from_state(state)
+                        cache = batch_cache.extract(0)
                     else:
                         parameters = inspect.signature(cache_cls.from_state).parameters
                         if "meta_state" in parameters:

@@ -662,10 +662,28 @@ class BlockAwarePrefixCache:
                 class_ref = layer_state.get("class_ref")
                 class_name = layer_state.get("class_name")
 
+                # Batch-one prefill snapshots may contain left padding and
+                # spare capacity. Convert with mlx-lm's own extraction before
+                # splitting the valid KV positions across blocks.
+                from mlx_lm.models.cache import BatchKVCache, KVCache
+
+                if class_ref is BatchKVCache:
+                    if state[0].shape[0] != 1:
+                        return None
+                    parameters = inspect.signature(class_ref.from_state).parameters
+                    if "meta_state" in parameters:
+                        batch_cache = class_ref.from_state(state, meta_state)
+                    else:
+                        batch_cache = class_ref.from_state(state)
+                    layer = batch_cache.extract(0)
+                    state = layer.state
+                    meta_state = getattr(layer, "meta_state", None)
+                    class_ref = KVCache
+                    class_name = "KVCache"
+
                 # mlx-lm 0.32 moved KVCache.offset into state. Keep only the
                 # valid key/value positions for block slicing; reconstruction
                 # derives the new offset from the joined blocks.
-                from mlx_lm.models.cache import KVCache
 
                 if class_ref is KVCache and len(state) == 3:
                     valid_length = int(state[2])

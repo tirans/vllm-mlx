@@ -901,6 +901,36 @@ class TestBlockAwarePrefixCache:
         assert restored[0].keys.shape[-2] == 8
         assert restored[0].keys.tolist() == layer.keys[..., :8, :].tolist()
 
+    def test_reconstructs_batch_one_kv_state_with_left_padding(self):
+        """A batched prefill snapshot stores only its eight valid tokens."""
+        from mlx_lm.models.cache import BatchKVCache, KVCache
+        import mlx.core as mx
+
+        from vllm_mlx.paged_cache import PagedCacheManager
+        from vllm_mlx.prefix_cache import BlockAwarePrefixCache
+
+        cache = BlockAwarePrefixCache(
+            model=None, paged_cache_manager=PagedCacheManager(block_size=4, max_blocks=10)
+        )
+        layer = BatchKVCache([2])
+        tokens = mx.arange(10).reshape(1, 1, 10, 1)
+        layer.update_and_fetch(tokens, tokens)
+        entry = {
+            "state": layer.state,
+            "meta_state": getattr(layer, "meta_state", None),
+            "class_ref": BatchKVCache,
+            "class_name": "BatchKVCache",
+        }
+
+        table = cache.store_cache("req", list(range(8)), [entry])
+        restored = cache.reconstruct_cache(table)
+
+        assert restored is not None
+        assert isinstance(restored[0], KVCache)
+        assert restored[0].offset == 8
+        assert restored[0].keys.shape[-2] == 8
+        assert restored[0].keys.tolist() == tokens[..., 2:, :].tolist()
+
     def test_deduplicated_terminal_uses_correct_recurrent_snapshot(self):
         """Deduplication must not leak recurrent state across sequences."""
         from mlx_lm.models.cache import KVCache

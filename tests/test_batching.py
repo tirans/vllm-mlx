@@ -257,6 +257,26 @@ class TestSchedulerBasic:
         assert restored[0].offset == 3
         assert restored[0].keys.tolist() == cache.keys.tolist()
 
+    @pytest.mark.parametrize("left_padding", [0, 2])
+    def test_batch_kv_cache_round_trip_discards_spare_capacity(self, left_padding):
+        """Mid-prefill restore keeps only the valid, unpadded batch-one KV."""
+        from mlx_lm.models.cache import BatchKVCache, KVCache
+
+        scheduler = object.__new__(Scheduler)
+        batch_cache = BatchKVCache([left_padding])
+        tokens = mx.array([[[[1], [2], [3]]]])
+        batch_cache.update_and_fetch(tokens, tokens)
+
+        states = scheduler._extract_cache_states([batch_cache])
+        assert len(states) == 1
+        restored = scheduler._reconstruct_cache_from_states(states)
+
+        assert restored is not None
+        assert isinstance(restored[0], KVCache)
+        assert restored[0].offset == 3 - left_padding
+        assert restored[0].keys.shape[2] == 3 - left_padding
+        assert restored[0].keys.tolist() == tokens[..., left_padding:, :].tolist()
+
     @pytest.fixture
     def mock_tokenizer(self):
         """Create a mock tokenizer."""
