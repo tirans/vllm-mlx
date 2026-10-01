@@ -16,10 +16,9 @@ GitHub Actions CI conventions. No new production dependency is required.
 
 **Spec:** [Updated design](../specs/2026-10-01-fork-maintenance-design.md).
 
-**Execution status (2026-10-01):** IN_PROGRESS. G1 and G2 are complete;
-P3A policy extraction is in progress, and P3B workflow/runbook preparation is
-complete. Final integrated review, candidate QA, hosted CI and publication are
-pending. The schedule remains dependency-based.
+**Execution status (2026-10-01):** IN_PROGRESS. G1 through G4 are complete at
+integrated candidate `1036ca3`; P3A and P3B are complete. Hosted CI and
+publication remain pending. The schedule remains dependency-based.
 
 ## Global constraints
 
@@ -58,11 +57,11 @@ evidence.
 | P0 | Owner updates plan; Architect checks boundaries | Latest critical review | Revised scope and contracts written | COMPLETE |
 | P1 | Architect inventories deltas; DevOps checks environment; QA establishes baseline after preflight | P0 | G1: source/environment pinned, inventory, baseline result | COMPLETE |
 | P2 | Coder repairs baseline failures or removes proven redundant delta; Reviewer and QA check each commit | P1 findings | G2: stable baseline; necessary fork changes retained | COMPLETE |
-| P3A | Coder extracts effort policy and adds characterization tests | G2 | Focused commit and targeted results | IN_PROGRESS |
+| P3A | Coder extracts effort policy and adds characterization tests | G2 | Focused commit and targeted results | COMPLETE at `1036ca3` |
 | P3B | DevOps adds fork workflow and maintenance runbook | G2 | Workflow/doc commits, focused review and guard checks | COMPLETE; hosted CI NOT_RUN |
-| P4 | Reviewer reviews the finished integrated diff; Owner combines accepted commits | P3A/P3B | G3: no unresolved correctness or scope findings | PENDING |
-| P5 | QA validates frozen integrated candidate | G3 | G4: required regression and suite checks pass | PENDING |
-| P6 | Owner refreshes remote state, scans outgoing changes and publishes | G4 | G5: final revision accepted and remote verified | PENDING |
+| P4 | Reviewer reviews the finished integrated diff; Owner combines accepted commits | P3A/P3B | G3: no unresolved correctness or scope findings | COMPLETE at `1036ca3` |
+| P5 | QA validates frozen integrated candidate | G3 | G4: required regression and suite checks pass | COMPLETE at `1036ca3`; hosted CI NOT_RUN |
+| P6 | Owner refreshes remote state, scans outgoing changes and publishes | G4 | G5: final revision accepted and remote verified | PREPUBLICATION CHECKS; push pending |
 
 ### Dated baseline and workflow evidence (2026-10-01)
 
@@ -79,13 +78,43 @@ acceptance. The reviewed repair was integrated at `4ce111c`; its `vllm_mlx/`
 and `tests/` trees are identical to `fc83413`. No fork implementation was
 removed as redundant.
 
-The P3B workflow/runbook commits are `196b76d` and `ab14fc1`. A local check
+The P3B workflow/runbook commits were integrated as `491ef49` and `70fb975`
+(source commits `196b76d` and `ab14fc1`). A local check
 of the workflow's extracted Linux guard returned exit codes 0 for a passing
 test, 1 for pass plus skip, 5 for collection skip, 5 for zero collection, and
 1 for a failing test. This validates the guard logic locally; hosted Linux and
 Apple Silicon jobs remain **NOT_RUN** until their actual CI results exist.
 These baseline results precede the P3A policy extraction and do not establish
 G4 acceptance for its integrated candidate.
+
+### Integrated candidate evidence (2026-10-01)
+
+At `1036ca3`, the policy helper and thin server adapter are integrated. Source,
+task and fresh whole-branch reviews found no unresolved findings across the 17
+changed files; the whole-branch reviewer used GPT-6 Astra/high. QA ran the
+workflow's actual blocks locally: pure policy **14 passed**, Apple fork fixtures
+**323 passed, no skips**, and fresh-process MLX stream fixtures **5 passed, no
+skips**. The Apple preflight reported MLX 0.32 and MLX-LM 0.31.3 on arm64.
+`pip show` could not run because the existing venv lacks pip; no install was
+performed. These are local command results, not hosted CI runs. QA then ran
+the full suite with `-ra` and JUnit output over 150 files in both orders:
+forward **3606 passed, 24 skipped, 27 deselected** in 78.29 seconds and
+reverse the same counts in 72.62 seconds, both exit 0. Logs and JUnit files
+are `/private/tmp/vllm-mlx-maintenance-integrated-full/{forward,reverse}.{log,junit.xml}`;
+the actual workflow block logs are under
+`/private/tmp/vllm-mlx-maintenance-integrated-workflow/`. The 24 skips are
+optional audio/models (3), live benchmark URL (2), optional OpenAI Harmony
+(12), structured-output model (2), and VLM/MTP weights or environment (5).
+No required fork fixture skipped. These skipped contracts remain **NOT_RUN**
+for their corresponding live or optional conditions; G4 covers the executed
+fixture/default suite contracts only. Hosted CI remains **NOT_RUN**.
+
+The owner refreshed both remotes: `upstream/main` remains `f5d7e00` and
+`origin/main` remains `82996d1`. A redacted scan of seven outgoing commits
+found no credentials. A scan of all 458 tracked files found only two intentional
+synthetic localhost credential fixtures. Local `.env` variants are ignored and
+`.env.example` contains a placeholder. Publication and remote verification are
+still pending.
 
 P1 can use Owner + Architect + DevOps + QA; DevOps host preflight must finish
 before QA starts resource-consuming checks. P3 uses Owner + Coder + DevOps.
@@ -115,26 +144,26 @@ remain serialized even when read-only review overlaps.
 `docs/development/fork-maintenance.md` containing the architect's classifications
 and later the maintenance runbook. No production code changes in this phase.
 
-- [ ] Owner records clean/dirty state, local/fork/upstream SHAs and remotes, fetches
+- [x] Owner records clean/dirty state, local/fork/upstream SHAs and remotes, fetches
   origin/upstream, and creates an integration branch from the current fork tip.
   If upstream advanced, merge on that branch and review every resolved conflict
   before choosing the baseline; do not start extractions during conflict resolution.
-- [ ] Create role worktrees at the pinned revision. Use distinct external paths
+- [x] Create role worktrees at the pinned revision. Use distinct external paths
   such as `/private/tmp/vllm-mlx-maintenance-qa` and role-specific branches for
   writers. Give every worker exact ownership and tell them not to revert other work.
-- [ ] DevOps checks architecture, Python/dependency versions and the existing venv,
+- [x] DevOps checks architecture, Python/dependency versions and the existing venv,
   shared port-8000 process state, host memory, model-cache requirements, and test
   imports. Avoid dumping environment variables or process arguments containing keys.
   Record the interpreter and runtime without installing or upgrading implicitly.
-- [ ] Verify worktree imports resolve to that worktree. Existing editable installs
+- [x] Verify worktree imports resolve to that worktree. Existing editable installs
   can otherwise import main while tests appear to exercise a candidate. Use
   `PYTHONPATH="$PWD"` from the role worktree and inspect module `__file__` there.
-- [ ] Architect inventories each retained behavior: source paths, base/fork SHAs,
+- [x] Architect inventories each retained behavior: source paths, base/fork SHAs,
   behavioral contract, existing tests, upstream equivalence evidence, disposition.
   Required rows: effort validation/listing; residency/count/priority; admission
   and cancellation; worker/cache affinity; scheduler recovery/MTP; stream errors;
   API key environment fallback; launcher/catalog; documentation-only corrections.
-- [ ] QA records collected tests and runs focused fork regressions, then full
+- [x] QA records collected tests and runs focused fork regressions, then full
   forward/reverse file order on an available Apple Silicon host. Preserve command,
   exit status, counts, skipped/deselected contracts and the first failure log.
 
@@ -196,19 +225,19 @@ inventory/pure checks. Do not mark a subset as full acceptance.
 **Owners:** Owner/Architect scope a bounded work packet; Coder edits; Reviewer
 reviews; QA reproduces and verifies. Do not assign the same source file to DevOps.
 
-- [ ] For each baseline failure, retain the first failing node and evidence,
+- [x] For each baseline failure, retain the first failing node and evidence,
   identify the affected behavior, and classify environment versus source causes.
-- [ ] Write a focused repair packet with exact files and acceptance case before
+- [x] Write a focused repair packet with exact files and acceptance case before
   assigning it; fix source regressions in separate commits from extraction.
-- [ ] Check whether restart-before-drain is covered behaviorally: an old iterator
+- [x] Check whether restart-before-drain is covered behaviorally: an old iterator
   remains active after stop times out; restart begins before that iterator is
   released; closure and cache cleanup finish on the old worker before new load.
   If missing, Coder adds an event-controlled fake-worker regression without real
   weights; QA verifies it. Do not introduce timing-only sleeps as proof of order.
-- [ ] Delete a fork implementation only when Architect identifies an equivalent
-  upstream implementation and QA demonstrates its contract. No redundancy has
-  yet been proven, so no specific deletion is preapproved by this plan.
-- [ ] Reviewer and QA accept each repair/removal. Establish the updated baseline
+- [x] Delete a fork implementation only when Architect identifies an equivalent
+  upstream implementation and QA demonstrates its contract. No redundancy was
+  proven, so deletion was not applicable in this execution.
+- [x] Reviewer and QA accept each repair/removal. Establish the updated baseline
   revision and repeat affected checks; repeat suite orders when code or observed
   failure scope justifies it before opening G2.
 
@@ -287,10 +316,10 @@ using `error_detail`. Applying replacement before raising preserves current
 mutation ordering. The helper returns validation errors as data for that reason.
 Do not add cache ownership or reinterpret falsey values.
 
-- [ ] Add missing characterization cases against the current adapter first.
+- [x] Add missing characterization cases against the current adapter first.
   Existing behavior tests should pass before extraction; do not force them red
   by changing expected behavior.
-- [ ] Add pure helper contract tests (red until the helper exists), including
+- [x] Add pure helper contract tests (red until the helper exists), including
   precedence, unsupported/unknown vocabularies, invalid defaults, unrelated
   kwargs, falsey request-template values, and input immutability. Example:
 
@@ -309,16 +338,16 @@ def test_default_effort_is_removed_without_mutating_input():
     assert original == {'reasoning_effort': 'low', 'enable_thinking': True}
 ```
 
-- [ ] Implement the helper and thin adapter. Keep support cache, listing,
+- [x] Implement the helper and thin adapter. Keep support cache, listing,
   `_resolve_chat_template_kwargs`, template introspection, and endpoint call sites
   in place. Pure tests import neither server nor MLX.
-- [ ] Run new tests plus existing effort/chat kwargs/Responses/Anthropic tests;
+- [x] Run new tests plus existing effort/chat kwargs/Responses/Anthropic tests;
   verify exact status/detail, absent-key shape, top-level precedence, and no
   support-probe call on a request with no effort.
-- [ ] Compare the adapter diff against the pinned baseline/upstream. Stop and
+- [x] Compare the adapter diff against the pinned baseline/upstream. Stop and
   revise if extraction requires changing lifecycle/caching, copying upstream
   implementations, or broad unrelated edits.
-- [ ] Commit as a focused behavior-preserving change, retaining test output for QA.
+- [x] Commit as a focused behavior-preserving change, retaining test output for QA.
 
 ## P3B — Add fork regression CI and maintenance runbook
 
@@ -329,27 +358,27 @@ def test_default_effort_is_removed_without_mutating_input():
 tests, or upstream `.github/workflows/ci.yml`. Consume the agreed new
 `tests/test_effort_policy.py` path from P3A; integration waits for both commits.
 
-- [ ] Add push/PR validation following repository workflow conventions, with
+- [x] Add push/PR validation following repository workflow conventions, with
   read-only contents permission and normal hosted runners. Do not add scheduled
   auto-merges, privileged untrusted PR execution, or deployment credentials.
-- [ ] Linux job: Python 3.10 and 3.13, install pytest, run only the dependency-light
+- [x] Linux job: Python 3.10 and 3.13, install pytest, run only the dependency-light
   `tests/test_effort_policy.py`. Fail on accidental server/MLX import dependencies.
-- [ ] Apple Silicon job: use existing project installation conventions and verify
+- [x] Apple Silicon job: use existing project installation conventions and verify
   actual arm64/MLX availability before running the fork fixture files from P1.
   Keep the model-loading `test_engine_core_stream_safety.py` in the separate
   cached-model gate. Keep stub-based Linux tests in a separate process from real
   MLX. Missing architecture/dependencies must fail visibly, not silently skip
   the job.
-- [ ] Add the new policy tests to the Apple job as well, so both jobs bind to the
+- [x] Add the new policy tests to the Apple job as well, so both jobs bind to the
   integrated implementation. Preserve logs and counts for skipped/deselected tests.
-- [ ] Document fixture checks separately from full local suite-order validation
+- [x] Document fixture checks separately from full local suite-order validation
   and real-model checks. A hosted job passing a subset does not satisfy G4 alone.
-- [ ] Document the inventory, standard remotes, integration worktree/branch process,
+- [x] Document the inventory, standard remotes, integration worktree/branch process,
   explicit local `rerere.autoupdate=false`, conflict review, targeted/full test
   gates, normal push, and remote verification. Link this plan as design history.
-- [ ] Include API key environment precedence and `.env` handling without populated
+- [x] Include API key environment precedence and `.env` handling without populated
   keys or credential-bearing command arguments. Keep raw logs outside Git.
-- [ ] Validate workflow syntax and inspect its permissions/triggers. QA executes
+- [x] Validate workflow syntax and inspect its permissions/triggers. QA executes
   its test commands in matching available environments; unavailable hosted results
   remain NOT_RUN until actually received. Commit workflow/docs together.
 
@@ -358,14 +387,15 @@ tests, or upstream `.github/workflows/ci.yml`. Consume the agreed new
 **Owners:** Reviewer GPT-6 Astra/high, read-only on a frozen candidate worktree;
 Owner integrates. Writers have finished before review begins.
 
-- [ ] Supply Reviewer with baseline/upstream/candidate SHAs, exact diff, inventory,
+- [x] Supply Reviewer with baseline/upstream/candidate SHAs, exact diff, inventory,
   spec, test commands/results, and changed dependency information.
-- [ ] Review behavior, ownership boundaries, error translation, imports, workflow
+- [x] Review behavior, ownership boundaries, error translation, imports, workflow
   safety, skip handling, and whether the upstream-owned change surface is actually
   reduced. Small line count alone is not enough.
-- [ ] Route findings back to the owning Coder or DevOps worktree. Review repaired
-  diffs and repeat affected tests. Do not let QA silently repair source.
-- [ ] Integrate accepted commits into the owner branch with normal history.
+- [x] Route findings back to the owning Coder or DevOps worktree. Review repaired
+  diffs and repeat affected tests. No final review findings required routing;
+  QA made no source edits.
+- [x] Integrate accepted commits into the owner branch with normal history.
 
 **G3:** No unresolved correctness findings or unauthorized scope expansion.
 
@@ -373,17 +403,17 @@ Owner integrates. Writers have finished before review begins.
 
 **Owner:** QA GPT-6 Luna/medium in a fresh worktree at the integrated commit.
 
-- [ ] Verify candidate import path/environment and repeat targeted policy and
+- [x] Verify candidate import path/environment and repeat targeted policy and
   endpoint checks against the integrated tree, not an earlier worker checkout.
-- [ ] Run the explicit fork regression set, including thread ownership, cache
+- [x] Run the explicit fork regression set, including thread ownership, cache
   materialization, queue cancellation, restart drainage, registry limits, SSE
   error signaling, CLI/environment key precedence, and compatibility fallback.
-- [ ] Run the full suite in forward/reverse file order on available hardware as
+- [x] Run the full suite in forward/reverse file order on available hardware as
   in P1, using a new candidate-specific log directory. Check skip/deselection
   details against required contracts; no tests marked PASS without execution.
-- [ ] Verify diff whitespace, no conflict markers, and no untracked credential
+- [x] Verify diff whitespace, no conflict markers, and no untracked credential
   files in the candidate. Confirm CI commands cover newly added fork tests.
-- [ ] Report PASS/FAIL/BLOCKED/NOT_RUN with exact SHA, environment, commands,
+- [x] Report PASS/FAIL/BLOCKED/NOT_RUN with exact SHA, environment, commands,
   exit codes, counts, evidence paths, and remaining live-model limitations.
 
 **G4:** Required checks pass and required contracts were executed. Blockers may
@@ -396,10 +426,10 @@ No throughput, real-model, or production-serving claim follows from fixture test
 authorization for the fork; it does not authorize upstream PR messages or changes
 to repository security settings.
 
-- [ ] Refresh origin/upstream and compare against the pinned source. If either
+- [x] Refresh origin/upstream and compare against the pinned source. If either
   relevant main branch advanced, integrate it normally, review new resolutions,
   and reopen affected acceptance gates before publishing. Avoid rewriting history.
-- [ ] Review all outgoing commits and final content with redacted secret scanning;
+- [x] Review all outgoing commits and final content with redacted secret scanning;
   verify local `.env` variants are ignored and `.env.example` is placeholder-only.
   Pattern scans are partial evidence; manually resolve any findings.
 - [ ] Confirm the accepted candidate, inventory/runbook, and test evidence agree.

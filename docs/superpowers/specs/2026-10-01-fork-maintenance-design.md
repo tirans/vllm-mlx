@@ -1,7 +1,7 @@
 # Fork maintenance design
 
-Status (2026-10-01): implementation in progress. The repaired baseline passed
-G2; policy extraction and final integrated validation remain pending.
+Status (2026-10-01): implementation, independent review and local candidate
+validation complete at `1036ca3` (G4). Hosted CI and publication remain pending.
 
 This replaces the five-extraction proposal previously stored at
 `/private/tmp/vllm-mlx-fork-merge-refactor-spec.md`. The implementation schedule is
@@ -26,7 +26,7 @@ No claim of conflict-free future merges is an acceptance criterion.
   received static checks and source review. Runtime baseline acceptance was
   NOT_RUN at that snapshot; the later G2 evidence is recorded in the plan.
 - Local `rerere.enabled` is true; `rerere.autoupdate` was unset when inspected.
-  DevOps will explicitly set autoupdate false for the integration checkout.
+  The integration checkout subsequently set `rerere.autoupdate=false`.
 
 These are a dated snapshot. Execution must record fresh branch and environment
 identities before using them as evidence.
@@ -79,7 +79,9 @@ The role-based execution includes meaningful characterization checks, existing
 API regression tests, and the repository-required full suite in forward and
 reverse file order. The original design update ran no tests. The later repaired
 baseline passed G2 at `fc83413`, with its counts and logs in the companion
-plan; final candidate QA and hosted CI remain pending.
+plan. The integrated candidate at `1036ca3` passed independent review,
+targeted local fixture checks and both full suite orders. Counts, skips and
+evidence paths are in the plan. Hosted CI and publication remain pending.
 
 Linux dependency-light tests, fixture tests on Apple Silicon, and real-model
 checks must be reported separately. Existing CI enumerates tests explicitly and
